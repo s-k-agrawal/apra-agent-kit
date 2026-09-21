@@ -151,6 +151,137 @@ test('conformance: anything other than "approve" denies', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// 5b. Irreversible work is capped per run
+// ---------------------------------------------------------------------------
+
+test('conformance: maxIrreversibleCalls caps writes within one run', async () => {
+  const g = createGuardrails({
+    maxIrreversibleCalls: 2,
+    approvalCallback: async () => 'approve',
+  }, [], executor);
+
+  const w = tool({ reversible: false, name: 'w' });
+  const args = { args: {}, traceId: 'tr-run-1' };
+
+  assert.equal((await g.execute(w, args)).ok, true, 'first write allowed');
+  assert.equal((await g.execute(w, args)).ok, true, 'second write allowed');
+
+  const third = await g.execute(w, args);
+  assert.equal(third.ok, false, 'third write must be refused');
+  assert.equal(third.reason, 'write_limit');
+  assert.equal(third.limit, 2);
+  assert.equal(third.used, 2);
+});
+
+test('conformance: the write cap is per run, not per process', async () => {
+  const g = createGuardrails({
+    maxIrreversibleCalls: 1,
+    approvalCallback: async () => 'approve',
+  }, [], executor);
+  const w = tool({ reversible: false, name: 'w' });
+
+  assert.equal((await g.execute(w, { args: {}, traceId: 'run-A' })).ok, true);
+  assert.equal((await g.execute(w, { args: {}, traceId: 'run-A' })).ok, false, 'run A is spent');
+
+  const otherRun = await g.execute(w, { args: {}, traceId: 'run-B' });
+  assert.equal(otherRun.ok, true, 'a different run must start with a fresh allowance');
+});
+
+test('conformance: reads are never counted against the write cap', async () => {
+  const g = createGuardrails({ maxIrreversibleCalls: 1, defaultPolicy: 'allow' }, [], executor);
+  const args = { args: {}, traceId: 'tr-reads' };
+  for (let i = 0; i < 5; i++) {
+    assert.equal((await g.execute(tool({ name: 'r' }), args)).ok, true, 'reads stay unlimited');
+  }
+  assert.equal(g.writeCount(args), 0);
+});
+
+test('conformance: a call with no traceId is not capped', async () => {
+  // The cap is per run and traceId identifies the run. Rather than counting
+  // untraced calls into a shared bucket — where one caller's writes would
+  // refuse an unrelated caller's — they are left unenforced.
+  const g = createGuardrails({
+    maxIrreversibleCalls: 1,
+    approvalCallback: async () => 'approve',
+  }, [], executor);
+  const w = tool({ reversible: false, name: 'w' });
+
+  for (let i = 0; i < 4; i++) {
+    const res = await g.execute(w, { args: {} });
+    assert.equal(res.ok, true, 'an untraced write must not be refused by the cap');
+  }
+  assert.equal(g.writeCount({ args: {} }), 0, 'untraced calls are not counted either');
+});
+
+test('conformance: untraced calls do not consume a traced run allowance', async () => {
+  const g = createGuardrails({
+    maxIrreversibleCalls: 1,
+    approvalCallback: async () => 'approve',
+  }, [], executor);
+  const w = tool({ reversible: false, name: 'w' });
+
+  await g.execute(w, { args: {} });               // untraced, uncapped
+  await g.execute(w, { args: {} });               // untraced, uncapped
+
+  const traced = await g.execute(w, { args: {}, traceId: 'tr-fresh' });
+  assert.equal(traced.ok, true, 'a traced run starts with its full allowance');
+});
+
+test('conformance: a refused write does not consume the allowance', async () => {
+  const g = createGuardrails({
+    maxIrreversibleCalls: 1,
+    approvalCallback: async () => 'deny',
+  }, [], executor);
+  const w = tool({ reversible: false, name: 'w' });
+  const args = { args: {}, traceId: 'tr-denied' };
+
+  assert.equal((await g.execute(w, args)).ok, false, 'approver refused it');
+  assert.equal(g.writeCount(args), 0, 'a write that never happened must not be charged');
+});
+
+// ---------------------------------------------------------------------------
+// 5c. Approvals are recorded, not just acted on
+// ---------------------------------------------------------------------------
+
+test('conformance: an approver identity is recorded on the result', async () => {
+  const g = createGuardrails({
+    approvalCallback: async () => ({ decision: 'approve', approvedBy: 'alice@example.com', reason: 'checked the diff' }),
+  }, [], executor);
+
+  const res = await g.execute(tool({ reversible: false }), { args: {}, traceId: 't' });
+  assert.equal(res.ok, true);
+  assert.equal(res.approval.approvedBy, 'alice@example.com');
+  assert.equal(res.approval.reason, 'checked the diff');
+  assert.ok(res.approval.at, 'an approval must carry a timestamp');
+});
+
+test('conformance: the original string contract still works', async () => {
+  const g = createGuardrails({ approvalCallback: async () => 'approve' }, [], executor);
+  const res = await g.execute(tool({ reversible: false }), { args: {} });
+  assert.equal(res.ok, true, 'returning the bare string must keep working');
+});
+
+test('conformance: an object denial records who refused and why', async () => {
+  const g = createGuardrails({
+    approvalCallback: async () => ({ decision: 'deny', approvedBy: 'bob', reason: 'out of scope' }),
+  }, [], executor);
+
+  const res = await g.execute(tool({ reversible: false }), { args: {} });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'approval_denied');
+  assert.equal(res.approvedBy, 'bob');
+  assert.equal(res.approvalReason, 'out of scope');
+});
+
+test('conformance: a malformed approval response denies', async () => {
+  for (const bad of [{ decision: 'maybe' }, {}, 42, null]) {
+    const g = createGuardrails({ approvalCallback: async () => bad }, [], executor);
+    const res = await g.execute(tool({ reversible: false }), { args: {} });
+    assert.equal(res.ok, false, `${JSON.stringify(bad)} must not permit execution`);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // 6. Trace ids reach tool execution
 // ---------------------------------------------------------------------------
 

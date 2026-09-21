@@ -121,8 +121,11 @@ deliberate, in which case update this document and say why.
 These are adopter decisions the kit takes no position on. They are listed so nobody assumes the kit
 handles them:
 
-- **Provenance** — marking records an agent wrote. Decide before your first write; it cannot be
-  retrofitted to rows already created.
+- **Provenance** — marking records an agent wrote. **Decide before your first write.** The kit takes
+  no position on how you mark agent-created data, but records written before you decide are
+  permanently indistinguishable from human-created ones — there is no migration that can tell them
+  apart afterwards. The mechanism is already here: `traceId` reaches every tool (§6), so a tool can
+  stamp it onto whatever it writes.
 - **Tenant isolation** — the kit has no tenant concept.
 - **Rate limiting** — budgets cap a single run, not a consumer.
 - **Secret distribution** — each clone handles its own.
