@@ -74,7 +74,39 @@ policies one by one. A per-tool `allow` must not defeat it.
 that cannot see what is about to happen cannot approve it meaningfully, and an approval UI that shows
 only a tool name trains people to click yes.
 
-Anything other than the exact string `'approve'` denies.
+The callback may return either form:
+
+```js
+'approve' | 'deny'                    // original contract
+{ decision, approvedBy, reason }      // also records who decided, and why
+```
+
+Anything other than `'approve'` — or `{ decision: 'approve' }` — denies, including a malformed
+response. On approval the result carries `approval: { approvedBy, reason, at }`; the kit returns that
+record and does nothing else with it, because only you know where it belongs.
+
+**The kit does not yet ship a way to reach a human.** There is no built-in transport that puts the
+question in front of someone, so `approvalCallback` is whatever you write. Until you write one, the
+`approve` policy denies and `approvedBy` is null. Wiring is the whole job:
+
+```js
+guardrails: {
+  approvalCallback: async ({ tool, args, context }) => {
+    const answer = await yourApprovalUi.ask({
+      tool: tool.name,
+      args,
+      traceId: context.traceId,      // correlates back to the run
+    });
+    return answer.ok
+      ? { decision: 'approve', approvedBy: answer.user, reason: answer.note }
+      : { decision: 'deny', approvedBy: answer.user, reason: answer.note };
+  },
+}
+```
+
+A first-class transport — `waiting_input` job status, `POST /jobs/:id/input`, SSE delivery, budget
+pause while waiting, and a timeout — is tracked in issue #30. Until it lands, the callback above is
+the supported route.
 
 **Must hold:** the callback receives `tool` and `args`; only `'approve'` permits.
 
@@ -121,11 +153,17 @@ deliberate, in which case update this document and say why.
 These are adopter decisions the kit takes no position on. They are listed so nobody assumes the kit
 handles them:
 
-- **Provenance** — marking records an agent wrote. Decide before your first write; it cannot be
-  retrofitted to rows already created.
+- **Provenance** — marking records an agent wrote. **Decide before your first write.** The kit takes
+  no position on how you mark agent-created data, but records written before you decide are
+  permanently indistinguishable from human-created ones — there is no migration that can tell them
+  apart afterwards. The mechanism is already here: `traceId` reaches every tool (§6), so a tool can
+  stamp it onto whatever it writes.
 - **Tenant isolation** — the kit has no tenant concept.
 - **Rate limiting** — budgets cap a single run, not a consumer.
 - **Secret distribution** — each clone handles its own.
-- **Authentication of the approver** — the callback returns a decision, not an identity.
+- **Authentication of the approver** — the callback may now report an identity, but the kit does not
+  verify it. Whoever writes the callback vouches for `approvedBy`.
+- **Reaching the approver** — there is no shipped transport that puts an approval request in front of
+  a human; see §4 and issue #30.
 
 See `docs/kit-adoption-gaps.md` for the full list.
