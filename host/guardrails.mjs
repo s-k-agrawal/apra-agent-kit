@@ -121,6 +121,12 @@ function createWriteCounter() {
 // The callback may return a bare 'approve'/'deny' (the original contract) or
 // { decision, approvedBy, reason }. Normalise both into one shape so an
 // approval can be recorded rather than just acted on.
+//
+// Note on reach: the kit records who approved, but does not yet ship a way to
+// put the question in front of a human. Until an adopter supplies a callback
+// that reaches one, approvedBy is null and the approve policy denies. The
+// transport — waiting_input job status, POST /jobs/:id/input, SSE delivery,
+// budget pause and timeout — is tracked in issue #30.
 function normaliseApproval(raw) {
   if (typeof raw === 'string') {
     return { approved: raw === 'approve', approvedBy: null, reason: null };

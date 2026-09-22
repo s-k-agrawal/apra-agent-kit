@@ -98,7 +98,7 @@ tool server plus an autonomous run loop with budgets and guardrails; the rest is
 | 5.2 | **Eval harness** | No automated quality gate. Write the fixtures anyway — a fixed question set with known-good outputs. They become the harness's input when it lands, and writing them early forces behaviour to be specified rather than improvised |
 | 5.3 | **Async dispatch** (accept-then-poll) | `POST /task` is synchronous and blocks for the length of the run. Any caller that cannot hold a connection open that long is blocked |
 | 5.4 | **Memory, run-state checkpoints, crash recovery** | A crashed run cannot resume. Acceptable for short plans; not for fan-out or long-running work |
-| 5.5 | **Human-in-the-loop approval transport** | The `approvalCallback` interface exists, but how a human actually reaches it is left to the adopter. In-session chat satisfies it only for interactive use |
+| 5.5 | **Human-in-the-loop approval transport** (issue #30) | The `approvalCallback` interface exists, but how a human actually reaches it is left to the adopter. In-session chat satisfies it only for interactive use |
 
 ---
 
