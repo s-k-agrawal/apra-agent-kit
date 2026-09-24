@@ -1,6 +1,16 @@
 # Fleet Agent Kit — Durable Human Input
 
-Status: proposed design — not yet implemented. Supersedes the in-memory approach in #30.
+Status: proposed design — not yet implemented. Supersedes the approach in #30 that keeps a paused
+run alive in the host process.
+
+> **A note on the word "memory".** This document does not use it loosely. `memory` appears only as
+> the name of an existing store backend (`store: { kind: 'memory' }` — the in-process Map used by
+> tests, alongside `sqlite` and `cosmos`). Where the old approach is described, it is called
+> *in-process* rather than *in-memory*.
+>
+> **This is unrelated to the kit's memory module** — the working context, long-term facts and recall
+> described in `docs/specs/phase3-memory-eval-spec.md`. Nothing here reads, writes or depends on
+> that module. A paused run's saved state is job storage, not agent memory.
 
 ## What this ships
 
@@ -186,7 +196,7 @@ Unchanged — `STORE_METHODS` in `host/jobs/store/interface.mjs`. Human input ne
 
 | Backend | Target | Notes |
 |---|---|---|
-| `memory` | tests | existing |
+| `memory` | tests | existing — an in-process Map, not the kit's memory module |
 | `sqlite` | VM / local file | existing; record is already a JSON column, so snapshot and pending need no migration |
 | `cosmos` | Azure Functions | **new** — same contract |
 

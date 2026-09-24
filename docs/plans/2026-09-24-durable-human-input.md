@@ -1,5 +1,9 @@
 # Durable Human Input — Implementation Plan
 
+*"Memory" is not used loosely in this plan. `memory` names an existing store backend only; the
+approach being replaced is called *in-process*. Neither relates to the kit's memory module in
+`docs/specs/phase3-memory-eval-spec.md`.*
+
 **Goal:** A run that needs something from a person saves its state, releases its worker and stops;
 when the answer arrives — on any machine, after any restart — a fresh worker rebuilds it and
 continues. Five question kinds, asked in batches, by the safety layer, the agent or a capability.
@@ -223,7 +227,7 @@ proceed alongside them.
 
 **Integration** — the success criteria as tests, listed in spec §14. The three that matter most are
 *pause → restart the host → answer → complete*, *answer on a second instance*, and *worker released
-while waiting*, because those are the three things the current in-memory design cannot do.
+while waiting*, because those are the three things the current in-process design cannot do.
 
 **Regression discipline** — before and after each task, run the existing suites and compare failing
 test **names**. Counts hide a swap of one failure for another. Known pre-existing failures on Windows
