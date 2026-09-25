@@ -162,6 +162,13 @@ Tasks 1–4 are independent and can run in parallel.
       answer; replay history does not grow across a pause; history survives output → input
 - [ ] **Commit**
 
+### Task 12a — Optional Cosmos store *(can ship after everything else)*
+- [ ] `host/jobs/store/cosmos.mjs` — the unchanged `STORE_METHODS`, lazily imported, never loaded
+      unless `store.kind === 'cosmos'`
+- [ ] Run the **existing shared store-contract suite** against it with no edits to the suite
+- [ ] Skip cleanly when no emulator is present, so CI without Cosmos stays green
+- [ ] **Commit**
+
 ### Task 12 — Azure: purge safety and the sweep
 - [ ] `host/jobs/durable.mjs` — **`purgeInstanceHistory` must exclude `waiting_input`.** A paused run
       is a *completed* instance, so the existing purge would destroy the only copy of its state

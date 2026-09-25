@@ -5,7 +5,7 @@ run alive in the host process.
 
 > **A note on the word "memory".** This document does not use it loosely. `memory` appears only as
 > the name of an existing store backend (`store: { kind: 'memory' }` — the in-process Map used by
-> tests, alongside `sqlite`). Where the old approach is described, it is called
+> tests, alongside `sqlite` and `cosmos`). Where the old approach is described, it is called
 > *in-process* rather than *in-memory*.
 >
 > **This is unrelated to the kit's memory module** — the working context, long-term facts and recall
@@ -199,8 +199,24 @@ Unchanged — `STORE_METHODS` in `host/jobs/store/interface.mjs`. Human input ne
 | Backend | Target | Notes |
 |---|---|---|
 | `memory` | tests | existing — an in-process Map, not the kit's memory module |
-| `sqlite` | VM / local file | existing; the record is already a JSON column, so snapshot and pending need no migration |
-| *(durable)* | Azure Functions | **no new backend** — see below |
+| `sqlite` | single VM / local file | existing; the record is already a JSON column, so snapshot and pending need no migration |
+| `cosmos` | **optional** — several instances without Durable Functions | new, opt-in. Not required by any deployment this kit ships |
+| *(durable)* | Azure Functions | **no store needed** — the task hub is the store, see below |
+
+#### Why `cosmos` exists even though nothing needs it
+
+The two shipped stores cover the two shipped deployments: `sqlite` for one VM, the task hub for
+Azure Functions. Neither covers **several instances of the in-process backend behind a load
+balancer** — `sqlite` is one machine, and the task hub only exists if you are on Durable Functions.
+
+This is a kit that gets cloned, and that gap is a real one for an adopter running containers on
+something other than Functions. `cosmos` is therefore shipped as an **optional** third
+implementation of the unchanged `STORE_METHODS`, lazily imported and never loaded unless
+`store.kind === 'cosmos'`. It also serves anyone who wants job history to outlive the task hub's
+purge (see §4.3).
+
+It is an adapter, not a dependency: the default path never touches it, and removing it would not
+change any shipped deployment.
 
 ### Azure: the task hub is the store
 
@@ -485,7 +501,7 @@ modules: {
   },
 },
 dispatch: {
-  store: { kind: 'sqlite' | 'memory' },   // unchanged — durable uses the task hub
+  store: { kind: 'sqlite' | 'memory' | 'cosmos' },  // durable ignores this — it uses the task hub
 },
 ```
 
@@ -498,6 +514,9 @@ guardrails behaving exactly as they do today.
 ## 12. Directory structure (new files)
 
 ```
+host/jobs/store/
+  cosmos.mjs           ← optional third implementation of STORE_METHODS
+
 host/human-input/
   batch.mjs            ← batch + question shapes, validation, newBatchId()
   questions.mjs        ← the five kinds, per-kind answer validation
@@ -522,7 +541,7 @@ host/human-input/
 | `host/jobs/durable.mjs` | `provideInput()` starts a **new** orchestration; `pendingInput()` reads `customStatus`; **`purgeInstanceHistory` excludes `waiting_input`** |
 | `comm/azure-functions/orchestrator.mjs` | complete the orchestration on a `paused` activity outcome — **no `waitForExternalEvent`, no `Task.any`** |
 | `comm/azure-functions/activity.mjs` | return `paused` rather than blocking |
-| `host/jobs/config.mjs` | `humanInput` block, defaults, dependency warnings |
+| `host/jobs/config.mjs` | `humanInput` block, defaults, dependency warnings; optional `cosmos` store kind |
 | `host/tasks.mjs` | inject `askUser`; wrap it in budget `pause`/`resume`; handle the `paused` return |
 | `host/run-loop.mjs` | thread `askUser`; return `{ status: 'paused', … }` instead of blocking |
 | `host/strategies/*.mjs` | pass `askUser` on `executorArgs`; propagate a pause; accept an answer as an observation and allow a replan |
@@ -551,9 +570,11 @@ host/human-input/
 | `guardrails.mjs` | `approvalCallback` keeps precedence; `askUser` used only when absent; deny/expiry/cancel all refuse; neither present behaves exactly as today |
 | `sweep.mjs` | staleness marks without settling; expiry settles as refused |
 | `durable.mjs` | pause writes output + `customStatus` marker; resume reads them; **purge skips `waiting_input`** |
+| `cosmos.mjs` | the shared store-contract suite, against the emulator — optional, skipped when unavailable |
 
-The existing `tests/helpers/store-contract.mjs` runs unchanged against `memory` and `sqlite`. No
-third implementation is added, so there is nothing new for it to cover — which is the point.
+The existing `tests/helpers/store-contract.mjs` runs unchanged against `memory`, `sqlite` and —
+where an emulator is available — `cosmos`. That suite passing against a new backend with no edits is
+the evidence that `STORE_METHODS` did not have to change.
 
 ### Integration
 
