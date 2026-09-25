@@ -5,7 +5,7 @@ run alive in the host process.
 
 > **A note on the word "memory".** This document does not use it loosely. `memory` appears only as
 > the name of an existing store backend (`store: { kind: 'memory' }` — the in-process Map used by
-> tests, alongside `sqlite` and `cosmos`). Where the old approach is described, it is called
+> tests, alongside `sqlite`). Where the old approach is described, it is called
 > *in-process* rather than *in-memory*.
 >
 > **This is unrelated to the kit's memory module** — the working context, long-term facts and recall
@@ -20,7 +20,8 @@ continues. Nothing is held while waiting.
 
 Five kinds of question, asked in batches, raised by the safety layer, the agent, or a capability.
 Answers may revise the remaining plan and may reverse work already done. Ships for both deployment
-targets in one go: **SQLite/local file** on a VM, **Cosmos** on Azure Functions.
+targets in one go: **SQLite/local file** on a VM, and the **Durable task hub** on Azure
+Functions — no new storage service on either.
 
 ## Relationship to existing code
 
@@ -34,8 +35,8 @@ adding a second one. The mapping is close to exact:
 | The open question | a field on the job record |
 | Find everything paused | `store.listByStatus('waiting_input')` |
 
-**No new store methods.** `STORE_METHODS` in `host/jobs/store/interface.mjs` is unchanged; Cosmos
-becomes a third implementation of the same contract alongside `memory` and `sqlite`.
+**No new store methods and no new backend.** `STORE_METHODS` in `host/jobs/store/interface.mjs` is
+unchanged. On Azure the durable backend keeps using the task hub, exactly as it does today — see §4.
 
 One correction to the original issue: the run loop, the strategies and guardrails change, but no
 existing module is restructured. With human input disabled, behaviour is byte-for-byte what it is
@@ -52,7 +53,7 @@ One interruption carries many questions. A form, not a chat.
   batchId: 'inp-a3f19c284d61',      // newRequestId()-style, unique per batch
   jobId: 'job-7c21b9e4f038',
   askedBy: 'guardrail' | 'agent' | 'tool',
-  askedByDetail: 'logbook_create',  // tool name, or null for agent/guardrail
+  askedByDetail: 'geocode',         // tool name, or null for agent/guardrail
   questions: [ /* Question[] — see below */ ],
   askedAt:    '2026-09-24T09:14:22.104Z',
   staleAfter: '2026-09-25T09:14:22.104Z',   // soft: warn on resume past this
@@ -64,12 +65,12 @@ One interruption carries many questions. A form, not a chat.
 
 ```js
 {
-  fieldId: 'building',              // unique within the batch; the answer key
+  fieldId: 'destination',           // unique within the batch; the answer key
   kind: 'approval' | 'pick_one' | 'pick_many' | 'text' | 'pick_one_or_text',
-  prompt: 'Which building is this for?',   // plain language — see the rule below
+  prompt: 'Which Paris did you mean?',     // plain language — see the rule below
   options: [                        // choice kinds only
-    { value: 'b-1f2e', label: 'Tower A' },
-    { value: 'b-9a44', label: 'Riverside' },
+    { value: 'geo-2988507', label: 'Paris, France' },
+    { value: 'geo-4717560', label: 'Paris, Texas, USA' },
   ],
   allowOther: false,                // pick_one_or_text: show a free-text box too
   otherPrompt: null,                // label for that box
@@ -87,8 +88,8 @@ a two-item `pick_one` because the guardrail must be able to recognise permission
 parameter names, no internal structure.
 
 ```
-good:  "Create an incident entry for Tower A saying 'fire in the basement'?"
-bad:   "Execute logbook_create with sLogBookTypeId=5, BuildingId=a3f1-…?"
+good:  "Which Paris did you mean — France, or Texas?"
+bad:   "geocode returned 2 candidates; select feature_id (2988507|4717560)?"
 ```
 
 Two reasons: a question nobody understands trains people to approve reflexively, and internal
@@ -101,11 +102,11 @@ identifier; `options[].label` may not.
 {
   batchId: 'inp-a3f19c284d61',
   answers: {
-    building: 'b-9a44',                       // pick_one → option value
-    scope:    ['s-11', 's-12'],               // pick_many → array of values
-    summary:  'Sprinklers activated level 2', // text → string
-    category: { other: 'Water ingress' },     // pick_one_or_text → chose Other
-    proceed:  'approve',                      // approval → 'approve' | 'deny'
+    destination: 'geo-2988507',               // pick_one → option value
+    compareWith: ['geo-2950159', 'geo-3169070'], // pick_many → array of values
+    emphasis:    'Budget options and rain cover', // text → string
+    travelMonth: { other: 'Late September' },  // pick_one_or_text → chose Other
+    proceed:     'approve',                    // approval → 'approve' | 'deny'
   },
   answeredBy: 'person-6f2a',
   answeredAt: '2026-09-24T09:31:07.882Z',
@@ -152,7 +153,8 @@ needed to reverse a step are often derivable only from its result.
 
 **History is never ring-buffered.** `ringEvents()` exists for the Azure `customStatus` view, which
 has a hard size limit; it must not be applied to the stored history. On Azure the history therefore
-lives in Cosmos, and `customStatus` remains a live-progress view only, never a source of truth.
+lives in the paused orchestration's output, and `customStatus` remains a live-progress view only,
+never a source of truth.
 
 ---
 
@@ -197,26 +199,50 @@ Unchanged — `STORE_METHODS` in `host/jobs/store/interface.mjs`. Human input ne
 | Backend | Target | Notes |
 |---|---|---|
 | `memory` | tests | existing — an in-process Map, not the kit's memory module |
-| `sqlite` | VM / local file | existing; record is already a JSON column, so snapshot and pending need no migration |
-| `cosmos` | Azure Functions | **new** — same contract |
+| `sqlite` | VM / local file | existing; the record is already a JSON column, so snapshot and pending need no migration |
+| *(durable)* | Azure Functions | **no new backend** — see below |
 
-### Cosmos partitioning — a decision this spec makes
+### Azure: the task hub is the store
 
-Partitioning by `jobId` is right for the hot path (all reads and writes for one job hit one
-partition) but makes `listByStatus('waiting_input')` a cross-partition query — and that is exactly
-what the staleness sweep runs on a schedule.
+The durable jobs spec already settles this: *"Durable's task hub is the Azure store."* This design
+keeps that promise and introduces **no Cosmos dependency, no new service, and no new package**.
 
-**Decision: a small secondary `pending` collection**, partitioned by a coarse bucket (for example
-`yyyy-mm` of `askedAt`), holding one lightweight document per waiting job:
-`{ jobId, batchId, personId, askedAt, staleAfter, expiresAt }`. Written when a job pauses, deleted
-when it resumes or settles.
+It works because of the shape chosen in §5 — the orchestration *ends* at the pause and a *new* one
+starts on resume. That gives us a natural place to keep state that Durable already persists for us.
 
-The sweep and any future notification job read only this collection. The alternative — a synthetic
-status partition key — keeps everything in one container but makes the hot path pay for a query it
-never needs. The duplication is small, bounded by the number of *currently waiting* jobs, and always
-reconstructible from `listByStatus`.
+| What | Where | Why it fits |
+|---|---|---|
+| History + snapshot | the paused orchestration's **output** | Durable persists orchestration output in the task hub and blob-offloads large payloads automatically. No size wrangling on our side. |
+| The pending marker | `customStatus` on the completed instance | Small and bounded — `{ status: 'waiting_input', batchId, staleAfter, expiresAt }`, far inside the 16 KB limit. It is what makes a paused instance identifiable. |
+| Resume input | input to the **new** orchestration | Read the previous output with `getStatus`, pass it forward. |
+| Find everything paused | `getStatusBy({ runtimeStatus: ['Completed'] })`, filtered on `customStatus.status` | `getStatusBy` is already used for backpressure counting. |
 
-SQLite needs none of this; `listByStatus` is already indexed.
+**`customStatus` is not the history.** It stays what it is today — a live progress view holding a
+bounded ring of the last 50 events. The history that this design treats as a source of truth lives in
+the orchestration output, which is unbounded and offloaded.
+
+#### Three consequences, stated honestly
+
+**History is copied on each pause.** It travels output → input on every pause/resume cycle. Bounded
+by `maxInterruptions` (default 10), so at most ten copies of a history that is itself bounded by the
+run. Acceptable, and the alternative — an external append store — is the Cosmos dependency we are
+avoiding.
+
+**The sweep scans completed instances.** Filtering `getStatusBy` on `customStatus` means a scan
+proportional to completed instances in the task hub, not to paused ones. Fine at modest volume. If
+it becomes a problem the upgrade is a small index — an Azure Table in the storage account the task
+hub already uses — which costs no new service either. Not built now; noted as the known escape.
+
+**Purging must skip paused runs.** `purgeInstanceHistory` is already used to clear completed
+instances. A paused run *is* a completed instance, and purging one destroys the only copy of its
+state. **The purge must exclude instances whose `customStatus.status` is `waiting_input`.** This is
+the sharpest hazard the design introduces on Azure, and it is a one-line condition that is easy to
+omit — it gets its own test.
+
+### SQLite
+
+Needs none of the above. `listByStatus('waiting_input')` is already indexed, `appendEvent`/`events`
+already give an unbounded history, and the record is already JSON so the snapshot needs no migration.
 
 ---
 
@@ -236,7 +262,8 @@ waiting_input: → processing | cancelled | failed
 ### Pausing
 
 1. Capture the snapshot; append `question_asked`.
-2. Persist both, plus `pendingInput` on the record; write the `pending` row on Cosmos.
+2. Persist both, plus `pendingInput` on the record. On Azure this is the orchestration output
+   plus the `customStatus` marker.
 3. Transition to `waiting_input`; publish `input_required`.
 4. **Release the worker lease and return.** The run unwinds out of the run loop rather than blocking
    inside it.
@@ -325,13 +352,15 @@ Across a pause the elapsed clock is reconstructed from the snapshot, so budget s
 Two optional fields on a tool definition:
 
 ```js
+// Illustrative — every tool in the kit today is read-only, so nothing
+// currently declares `undo`. Shown with a hypothetical write tool.
 {
-  name: 'logbook_create',
+  name: 'save-trip-plan',
   reversible: false,
   undo: {
     mandatory: false,                 // true → reversed automatically, person told after
     run: async ({ result, args, fleetApi }) => { /* the reverse action */ },
-    describe: ({ result }) => 'the logbook entry I created',   // plain language
+    describe: ({ result }) => 'the trip plan I saved',   // plain language
   },
 }
 ```
@@ -456,7 +485,7 @@ modules: {
   },
 },
 dispatch: {
-  store: { kind: 'sqlite' | 'memory' | 'cosmos', /* cosmos: endpoint, database, containers */ },
+  store: { kind: 'sqlite' | 'memory' },   // unchanged — durable uses the task hub
 },
 ```
 
@@ -482,8 +511,6 @@ host/human-input/
     describe.mjs       ← plain-language rendering of what can and cannot be undone
   index.mjs            ← createHumanInput() wires the enabled pieces
 
-host/jobs/store/
-  cosmos.mjs           ← third implementation of STORE_METHODS
 ```
 
 ## 13. Changes to existing files
@@ -492,10 +519,10 @@ host/jobs/store/
 |---|---|
 | `host/jobs/record.mjs` | `waiting_input` in `STATUSES`; transitions; `pendingInput` and `snapshot` on the record; `inputRequiredEvent` / `inputResolvedEvent`; history entry builders |
 | `host/jobs/in-process.mjs` | handle a `paused` outcome: persist, transition, **release the lease**; `provideInput()`; enqueue a resume; release waiters on `stop()` |
-| `host/jobs/durable.mjs` | `provideInput()` starts a **new** orchestration; `pendingInput()` reads the record |
+| `host/jobs/durable.mjs` | `provideInput()` starts a **new** orchestration; `pendingInput()` reads `customStatus`; **`purgeInstanceHistory` excludes `waiting_input`** |
 | `comm/azure-functions/orchestrator.mjs` | complete the orchestration on a `paused` activity outcome — **no `waitForExternalEvent`, no `Task.any`** |
 | `comm/azure-functions/activity.mjs` | return `paused` rather than blocking |
-| `host/jobs/config.mjs` | `humanInput` block, defaults, dependency warnings; `cosmos` store kind |
+| `host/jobs/config.mjs` | `humanInput` block, defaults, dependency warnings |
 | `host/tasks.mjs` | inject `askUser`; wrap it in budget `pause`/`resume`; handle the `paused` return |
 | `host/run-loop.mjs` | thread `askUser`; return `{ status: 'paused', … }` instead of blocking |
 | `host/strategies/*.mjs` | pass `askUser` on `executorArgs`; propagate a pause; accept an answer as an observation and allow a replan |
@@ -523,10 +550,10 @@ host/jobs/store/
 | `reversal/describe.mjs` | rendering contains no identifier, tool name or parameter name |
 | `guardrails.mjs` | `approvalCallback` keeps precedence; `askUser` used only when absent; deny/expiry/cancel all refuse; neither present behaves exactly as today |
 | `sweep.mjs` | staleness marks without settling; expiry settles as refused |
-| `cosmos.mjs` | the shared store-contract suite, against an emulator |
+| `durable.mjs` | pause writes output + `customStatus` marker; resume reads them; **purge skips `waiting_input`** |
 
-The existing `tests/helpers/store-contract.mjs` runs unchanged against all three backends — the
-strongest evidence that Cosmos is a drop-in.
+The existing `tests/helpers/store-contract.mjs` runs unchanged against `memory` and `sqlite`. No
+third implementation is added, so there is nothing new for it to cover — which is the point.
 
 ### Integration
 
@@ -550,6 +577,7 @@ Each of these is a success criterion, written as a test:
 | Reversal failure | stops, reports, raises the operator flag |
 | Azure: pause ends the orchestration | no orchestration alive during the wait |
 | Azure: answer starts a new orchestration | resumes correctly; no replay growth |
+| Azure: purge runs while a job is paused | the paused instance survives — its output is the only copy of its state |
 
 **Existing suites must keep passing unchanged** — `test:host`, `test:phase2`, `test:phase4`,
 `test:unit`, `test:integration` — and the durable-human-input tests join `test:host`.

@@ -11,21 +11,22 @@ Answers may revise the plan and may reverse completed work. Both deployment targ
 
 **Spec:** `docs/specs/2026-09-24-durable-human-input-spec.md`
 
-**Architecture:** No new persistence layer. The Phase 4 job store already provides history
-(`appendEvent`/`events`), snapshot and pending question (fields on the record, via `update`), and
-"find everything paused" (`listByStatus`). Cosmos becomes a third implementation of the unchanged
-`STORE_METHODS`. The run loop gains a `paused` outcome so a pause unwinds out of it rather than
-blocking inside it — which is what allows the lease to be released.
+**Architecture:** No new persistence layer and no new storage service. The Phase 4 job store
+already provides history (`appendEvent`/`events`), snapshot and pending question (fields on the
+record, via `update`), and "find everything paused" (`listByStatus`). On Azure the **task hub stays
+the store**, exactly as the durable jobs spec already says: the paused orchestration's *output*
+carries history and snapshot, and a small `customStatus` marker makes it findable. The run loop
+gains a `paused` outcome so a pause unwinds out of it rather than blocking inside it — which is what
+allows the lease to be released.
 
 **Tech Stack:** Node 22 (≥ 22.16), ESM, `node:test`, `node:sqlite`, Zod v4, Express 5,
-`@azure/functions` v4 + `durable-functions` v3 (optional, lazy-loaded), `@azure/cosmos` (new,
-optional, lazy-loaded), Azurite + Cosmos emulator for tests.
+`@azure/functions` v4 + `durable-functions` v3 (optional, lazy-loaded), Azurite for tests.
+**No new dependency.**
 
 ## Global constraints
 
 - Node `>=22.16`. `node:sqlite` via `DatabaseSync` only.
-- `@azure/cosmos` is an **optional** dependency, imported lazily only when `store.kind === 'cosmos'`.
-  Non-Azure paths never load it.
+- No new package. Azure support is the existing `durable-functions` path; nothing new is imported.
 - Errors are values inside tools and the run loop. Only `AbortSignal` cancellation throws.
 - With `humanInput.enabled: false`, behaviour is byte-for-byte what it is today. Every task must
   leave that true.
@@ -57,8 +58,8 @@ Task 7   guardrails fallback                      (needs 6)
 Task 8   in-process pause/resume + lease release  (needs 3, 5)
 Task 9   routes + MCP tool                        (needs 8)
 Task 10  sweep: staleness + expiry                (needs 8)
-Task 11  cosmos store                             (needs 2, 3)
-Task 12  azure: pause ends orchestration          (needs 8, 11)
+Task 11  azure: pause/resume via the task hub      (needs 2, 3, 8)
+Task 12  azure: purge safety + sweep              (needs 11)
 Task 13  reversal: classify + describe            (needs 2)
 Task 14  reversal: execute + operator flag        (needs 13)
 Task 15  replan on answer                         (needs 6)
@@ -67,17 +68,15 @@ Task 17  integration suite                        (needs 16)
 Task 18  docs                                     (needs 16)
 ```
 
-Tasks 1–4 are independent and can run in parallel. Task 11 (Cosmos) is independent of 5–10 and can
-proceed alongside them.
+Tasks 1–4 are independent and can run in parallel.
 
 ---
 
 ## Tasks
 
-### Task 0 — Branch and optional dependency
+### Task 0 — Branch
 - [ ] Branch `feature/durable-human-input` from `main` *(already created)*
-- [ ] Add `@azure/cosmos` to `optionalDependencies`
-- [ ] Verify it is never imported at module load on a non-Cosmos path
+- [ ] No dependency changes — confirm `package.json` is untouched by this work
 - [ ] **Commit**
 
 ### Task 1 — Question batch and validation
@@ -152,21 +151,24 @@ proceed alongside them.
       left alone
 - [ ] **Commit**
 
-### Task 11 — Cosmos store
-- [ ] `host/jobs/store/cosmos.mjs` — `STORE_METHODS`, lazy `@azure/cosmos`
-- [ ] Secondary `pending` collection per spec §4, written on pause and deleted on resume/settle
-- [ ] Run the **existing shared store-contract suite** unchanged against it
-- [ ] Unit tests against the Cosmos emulator; the sweep reads only `pending`
+### Task 11 — Azure: pause and resume through the task hub
+- [ ] `comm/azure-functions/activity.mjs` — return `paused` rather than blocking
+- [ ] `comm/azure-functions/orchestrator.mjs` — on a `paused` outcome, set the small `customStatus`
+      marker and **complete** with history + snapshot as the orchestration output. **No
+      `waitForExternalEvent`, no `Task.any`** — the replay bug documented in that file must not return
+- [ ] `host/jobs/durable.mjs` — `provideInput()` reads the previous output via `getStatus` and starts
+      a **new** orchestration with it as input; `pendingInput()` reads `customStatus`
+- [ ] Unit tests with the existing mocks: nothing alive during a wait; a new orchestration starts on
+      answer; replay history does not grow across a pause; history survives output → input
 - [ ] **Commit**
 
-### Task 12 — Azure: the pause ends the orchestration
-- [ ] `comm/azure-functions/activity.mjs` — return `paused` rather than blocking
-- [ ] `comm/azure-functions/orchestrator.mjs` — complete on a `paused` outcome. **No
-      `waitForExternalEvent`, no `Task.any`** — the replay bug documented in that file must not
-      return
-- [ ] `host/jobs/durable.mjs` — `provideInput()` starts a **new** orchestration
-- [ ] Unit tests with the existing mocks: no orchestration alive during a wait; a new one starts on
-      answer; replay history does not grow across a pause
+### Task 12 — Azure: purge safety and the sweep
+- [ ] `host/jobs/durable.mjs` — **`purgeInstanceHistory` must exclude `waiting_input`.** A paused run
+      is a *completed* instance, so the existing purge would destroy the only copy of its state
+- [ ] Sweep finds paused runs via `getStatusBy({ runtimeStatus: ['Completed'] })` filtered on
+      `customStatus.status`
+- [ ] Unit tests: a purge run leaves paused instances intact; the sweep finds them; a settled
+      instance is still purged normally
 - [ ] **Commit**
 
 ### Task 13 — Reversal: classify and describe
@@ -190,7 +192,7 @@ proceed alongside them.
 - [ ] **Commit**
 
 ### Task 16 — Config and wiring
-- [ ] `host/jobs/config.mjs` — `humanInput` block, defaults, `cosmos` kind, dependency warning when
+- [ ] `host/jobs/config.mjs` — `humanInput` block, defaults, dependency warning when
       `humanInput` is enabled without `dispatch`
 - [ ] `host/human-input/index.mjs` — `createHumanInput()`
 - [ ] `host/index.mjs` — wire, start the sweep, `.humanInput()` on the builder
@@ -227,7 +229,9 @@ proceed alongside them.
 
 **Integration** — the success criteria as tests, listed in spec §14. The three that matter most are
 *pause → restart the host → answer → complete*, *answer on a second instance*, and *worker released
-while waiting*, because those are the three things the current in-process design cannot do.
+while waiting*, because those are the three things the current in-process design cannot do. On Azure,
+*purge while paused* matters as much: it is a one-line condition that is easy to omit and destroys
+state when it is.
 
 **Regression discipline** — before and after each task, run the existing suites and compare failing
 test **names**. Counts hide a swap of one failure for another. Known pre-existing failures on Windows
@@ -239,8 +243,9 @@ test **names**. Counts hide a swap of one failure for another. Known pre-existin
 
 These do not block starting, but each needs an answer before the relevant task:
 
-1. **Cosmos partitioning** (Task 11) — the spec chooses a secondary `pending` collection over a
-   synthetic status partition key. Confirm before building.
+1. **Sweep scan cost** (Task 12) — finding paused runs scans completed instances. Fine at modest
+   volume; the escape is a small Azure Table index in the storage account the task hub already uses.
+   Not built now — confirm that is acceptable for a first version.
 2. **Hard expiry default** (Task 10) — 7d proposed, 72h a reasonable alternative.
 3. **Retention** (not scheduled) — histories and snapshots hold full conversations and accumulate.
    Needs an owner; out of scope here.
