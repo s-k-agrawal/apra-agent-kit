@@ -198,10 +198,15 @@ Unchanged — `STORE_METHODS` in `host/jobs/store/interface.mjs`. Human input ne
 
 | Backend | Target | Notes |
 |---|---|---|
+| `auto` | **the default** | resolves per backend: `sqlite` on a VM, the **task hub** on Azure Functions. An adopter who never touches storage config gets the right thing on both |
 | `memory` | tests | existing — an in-process Map, not the kit's memory module |
 | `sqlite` | single VM / local file | existing; the record is already a JSON column, so snapshot and pending need no migration |
-| `cosmos` | **optional** — several instances without Durable Functions | new, opt-in. Not required by any deployment this kit ships |
-| *(durable)* | Azure Functions | **no store needed** — the task hub is the store, see below |
+| `cosmos` | several instances, or job state that must outlive the task hub | opt-in |
+| `taskhub` | Azure Functions, stated explicitly | what `auto` resolves to there |
+
+`auto` exists so the common case needs no decision. An adopter who *does* have an opinion — "I want
+everything in Cosmos even on Functions" — sets `kind` explicitly and the durable backend uses that
+store instead of the task hub.
 
 #### Why `cosmos` exists even though nothing needs it
 
@@ -249,16 +254,124 @@ proportional to completed instances in the task hub, not to paused ones. Fine at
 it becomes a problem the upgrade is a small index — an Azure Table in the storage account the task
 hub already uses — which costs no new service either. Not built now; noted as the known escape.
 
-**Purging must skip paused runs.** `purgeInstanceHistory` is already used to clear completed
+**Purging must skip live paused runs.** `purgeInstanceHistory` is already used to clear completed
 instances. A paused run *is* a completed instance, and purging one destroys the only copy of its
-state. **The purge must exclude instances whose `customStatus.status` is `waiting_input`.** This is
-the sharpest hazard the design introduces on Azure, and it is a one-line condition that is easy to
-omit — it gets its own test.
+state. The purge must skip instances whose `customStatus.status` is `waiting_input` **and that are
+younger than `expiresAt + graceDays`** — see §4.4 for why the condition is bounded rather than
+absolute. This is the sharpest hazard the design introduces on Azure, and it is a one-line condition
+that is easy to omit, so it gets its own test.
 
 ### SQLite
 
 Needs none of the above. `listByStatus('waiting_input')` is already indexed, `appendEvent`/`events`
 already give an unbounded history, and the record is already JSON so the snapshot needs no migration.
+
+---
+
+## 4.4 Retention: archive and expiry
+
+Never purging is not a neutral choice. The sweep that expires paused runs finds them by scanning
+completed instances, so an un-purged task hub makes that scan slower every day until it times out —
+at which point nothing expires, paused runs accumulate, and the scan gets worse still. Purging is
+load-bearing, not housekeeping.
+
+But purging destroys history, and this design deliberately builds history worth keeping: who
+approved what, what the agent actually did, what was reversed and what could not be. **The task hub
+is operational storage, not an archive.**
+
+So retention is two separate, independently configurable things.
+
+### Archive — the long-term copy
+
+```js
+retention: {
+  archive: {
+    enabled: false,
+    store: 'cosmos',      // any store adapter — where the long-term copy goes
+    when: 'on_settle',    // 'on_settle' | 'before_purge'
+  },
+}
+```
+
+When enabled, a settled run's history and final record are copied to a second store before the
+primary is ever cleared. The archive store is an ordinary `STORE_METHODS` implementation — the same
+adapter list, chosen independently of the operational store. Cosmos is the obvious choice on Azure;
+nothing stops an adopter pointing it elsewhere.
+
+**Invariant: never purge what failed to archive.** If archiving is enabled and the copy fails, the
+purge for that record does not run, the failure is logged and flagged to operators, and it is retried
+on the next pass. A purge that silently outruns a broken archive is the one way to lose data
+permanently, so the ordering is not negotiable.
+
+Disabled by default. An adopter who does not care about history beyond the operational window pays
+nothing.
+
+### Expiry — clearing the primary store
+
+```js
+retention: {
+  expiry: {
+    afterDays: 30,        // records older than this may be cleared
+    mode: 'auto',         // 'auto' | 'manual' | 'both'
+    graceDays: 1,         // extra margin before a paused run may ever be cleared
+  },
+}
+```
+
+| `mode` | Behaviour |
+|---|---|
+| `auto` | a scheduled sweep clears eligible records |
+| `manual` | nothing is cleared until an operator calls the purge route |
+| `both` | the scheduled sweep runs, and the route is available for an immediate pass |
+
+`manual` exists because some deployments are obliged to control deletion explicitly rather than let a
+timer do it.
+
+### What may be cleared, and what may not
+
+A record is eligible only when **all** of these hold:
+
+1. It is **settled** — not `queued`, `processing` or `waiting_input`.
+2. It is older than `afterDays`.
+3. If archiving is enabled, it has been **successfully archived**.
+
+Plus one deliberately narrow exception:
+
+> A `waiting_input` record is skipped **while it is younger than `expiresAt + graceDays`**. Past
+> that, it is cleared like anything else.
+
+The conditional form matters. An unconditional *"never purge `waiting_input`"* means that if the
+staleness sweep ever stops, those records are shielded forever and the store grows without bound —
+the exact failure that breaks the expiry sweep in turn. The conditional form self-heals: anything
+past its own expiry window should already have settled, and if it has not, the sweep is broken and
+the record is unrecoverable anyway.
+
+### Manual purge
+
+```
+POST /jobs/purge
+  { olderThanDays?, dryRun?: true }
+  → 200 { scanned, archived, cleared, skipped: { active, waiting, unarchived }, errors }
+```
+
+`dryRun` reports what *would* be cleared without clearing it — the first thing anyone sensible runs.
+The response separates *skipped because still active* from *skipped because archiving failed*,
+because those mean very different things: the first is normal, the second needs attention.
+
+Available whenever `mode` is `manual` or `both`.
+
+### Defaults, and what an adopter gets for free
+
+| Deployment | Store | Archive | Expiry |
+|---|---|---|---|
+| VM, nothing configured | `sqlite` | off | 30 days, automatic |
+| Azure Functions, nothing configured | task hub | off | 30 days, automatic |
+| Azure Functions, history matters | task hub | **on → Cosmos** | 30 days, automatic |
+| Regulated, deletion controlled | either | on | `manual` only |
+
+The default keeps the operational store healthy and loses history after a month. That is the right
+default for a kit — it cannot grow unboundedly on someone who never read this section — but it is a
+*loss*, and an adopter who needs the audit trail must turn archiving on deliberately.
 
 ---
 
@@ -461,6 +574,12 @@ POST /jobs/:id/input
 
 GET /jobs/:id
   → 200  { …record, pendingInput: <batch> | null, stale: true|false }
+
+POST /jobs/purge                      // only when retention.expiry.mode is 'manual' or 'both'
+  { olderThanDays?, dryRun?: true }
+  → 200  { scanned, archived, cleared,
+           skipped: { active, waiting, unarchived }, errors }
+  → 404  route absent when mode is 'auto'
 ```
 
 ### Events
@@ -501,7 +620,21 @@ modules: {
   },
 },
 dispatch: {
-  store: { kind: 'sqlite' | 'memory' | 'cosmos' },  // durable ignores this — it uses the task hub
+  store: { kind: 'auto' },     // 'auto' → sqlite on a VM, task hub on Functions.
+                               // Set explicitly to override: 'sqlite' | 'memory' | 'cosmos' | 'taskhub'
+  retention: {
+    archive: {
+      enabled: false,          // off by default — history is lost at expiry unless turned on
+      store: 'cosmos',         // any adapter; where the long-term copy goes
+      when: 'on_settle',       // 'on_settle' | 'before_purge'
+    },
+    expiry: {
+      afterDays: 30,
+      mode: 'auto',            // 'auto' | 'manual' | 'both'
+      graceDays: 1,            // margin before a paused record may ever be cleared
+      sweepIntervalMs: 3_600_000,
+    },
+  },
 },
 ```
 
@@ -515,7 +648,14 @@ guardrails behaving exactly as they do today.
 
 ```
 host/jobs/store/
-  cosmos.mjs           ← optional third implementation of STORE_METHODS
+  cosmos.mjs           ← optional implementation of STORE_METHODS
+  resolve.mjs          ← 'auto' → sqlite | taskhub, per backend
+
+host/retention/
+  archive.mjs          ← copy a settled run to the long-term store
+  expiry.mjs           ← eligibility rules + the sweep
+  routes.mjs           ← POST /jobs/purge
+  index.mjs            ← createRetention() wires archive + expiry
 
 host/human-input/
   batch.mjs            ← batch + question shapes, validation, newBatchId()
@@ -541,7 +681,8 @@ host/human-input/
 | `host/jobs/durable.mjs` | `provideInput()` starts a **new** orchestration; `pendingInput()` reads `customStatus`; **`purgeInstanceHistory` excludes `waiting_input`** |
 | `comm/azure-functions/orchestrator.mjs` | complete the orchestration on a `paused` activity outcome — **no `waitForExternalEvent`, no `Task.any`** |
 | `comm/azure-functions/activity.mjs` | return `paused` rather than blocking |
-| `host/jobs/config.mjs` | `humanInput` block, defaults, dependency warnings; optional `cosmos` store kind |
+| `host/jobs/config.mjs` | `humanInput` block, defaults, dependency warnings; `store.kind: 'auto'` resolution; the `retention` block |
+| `host/jobs/durable.mjs` | purge skips live paused instances (`waiting_input` younger than `expiresAt + graceDays`) |
 | `host/tasks.mjs` | inject `askUser`; wrap it in budget `pause`/`resume`; handle the `paused` return |
 | `host/run-loop.mjs` | thread `askUser`; return `{ status: 'paused', … }` instead of blocking |
 | `host/strategies/*.mjs` | pass `askUser` on `executorArgs`; propagate a pause; accept an answer as an observation and allow a replan |
@@ -569,7 +710,10 @@ host/human-input/
 | `reversal/describe.mjs` | rendering contains no identifier, tool name or parameter name |
 | `guardrails.mjs` | `approvalCallback` keeps precedence; `askUser` used only when absent; deny/expiry/cancel all refuse; neither present behaves exactly as today |
 | `sweep.mjs` | staleness marks without settling; expiry settles as refused |
-| `durable.mjs` | pause writes output + `customStatus` marker; resume reads them; **purge skips `waiting_input`** |
+| `durable.mjs` | pause writes output + `customStatus` marker; resume reads them; **purge skips live paused instances but clears ones past `expiresAt + graceDays`** |
+| `resolve.mjs` | `auto` → `sqlite` on in-process, `taskhub` on durable; an explicit kind wins |
+| `archive.mjs` | a settled run is copied before clearing; **a failed archive blocks the purge** and is retried |
+| `expiry.mjs` | eligibility: settled, old enough, archived; `manual` mode clears nothing on a timer; `dryRun` clears nothing |
 | `cosmos.mjs` | the shared store-contract suite, against the emulator — optional, skipped when unavailable |
 
 The existing `tests/helpers/store-contract.mjs` runs unchanged against `memory`, `sqlite` and —
@@ -599,6 +743,10 @@ Each of these is a success criterion, written as a test:
 | Azure: pause ends the orchestration | no orchestration alive during the wait |
 | Azure: answer starts a new orchestration | resumes correctly; no replay growth |
 | Azure: purge runs while a job is paused | the paused instance survives — its output is the only copy of its state |
+| Purge runs on a paused job past its expiry + grace | it *is* cleared — the skip is bounded, so a broken sweep cannot shield records forever |
+| Archive enabled, archive store unreachable | nothing is cleared; the failure is flagged; the next pass retries |
+| `mode: 'manual'`, timer fires | nothing is cleared |
+| `POST /jobs/purge` with `dryRun` | reports counts, clears nothing |
 
 **Existing suites must keep passing unchanged** — `test:host`, `test:phase2`, `test:phase4`,
 `test:unit`, `test:integration` — and the durable-human-input tests join `test:host`.
@@ -616,4 +764,5 @@ Each of these is a success criterion, written as a test:
 - **The existing durable `cancel` defect** — `cancelRequested` is never set, so cancel does nothing
   to a running activity. Real and worth fixing, but independent: this design never needs an external
   event delivered to a live activity.
-- **Retention.** Histories and snapshots hold full conversations and accumulate. Needs an owner.
+- **Which records an archive keeps forever.** §4.4 defines *how* to archive, not a policy for how
+  long the archive itself is kept. That is an adopter decision and deliberately not defaulted.

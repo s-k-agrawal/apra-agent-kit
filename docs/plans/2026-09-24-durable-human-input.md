@@ -19,6 +19,12 @@ carries history and snapshot, and a small `customStatus` marker makes it findabl
 gains a `paused` outcome so a pause unwinds out of it rather than blocking inside it — which is what
 allows the lease to be released.
 
+**Retention** is separate and configurable: `store.kind: 'auto'` picks sqlite on a VM and the task
+hub on Functions; an optional archive copies settled runs to a long-term store before expiry clears
+the primary; expiry runs on a timer, by an API call, or both. Purging is load-bearing — the sweep
+that expires paused runs scans completed instances, so an un-purged store degrades it until it stops
+working — which is why the paused-run skip is bounded rather than absolute.
+
 **Tech Stack:** Node 22 (≥ 22.16), ESM, `node:test`, `node:sqlite`, Zod v4, Express 5,
 `@azure/functions` v4 + `durable-functions` v3 (optional, lazy-loaded), Azurite for tests.
 **No new dependency.**
@@ -60,6 +66,10 @@ Task 9   routes + MCP tool                        (needs 8)
 Task 10  sweep: staleness + expiry                (needs 8)
 Task 11  azure: pause/resume via the task hub      (needs 2, 3, 8)
 Task 12  azure: purge safety + sweep              (needs 11)
+Task 12a optional cosmos store                    (independent)
+Task 12b store.kind 'auto' resolution             (needs 12a)
+Task 12c retention: archive                       (needs 12a)
+Task 12d retention: expiry + manual purge route   (needs 12c)
 Task 13  reversal: classify + describe            (needs 2)
 Task 14  reversal: execute + operator flag        (needs 13)
 Task 15  replan on answer                         (needs 6)
@@ -162,11 +172,34 @@ Tasks 1–4 are independent and can run in parallel.
       answer; replay history does not grow across a pause; history survives output → input
 - [ ] **Commit**
 
-### Task 12a — Optional Cosmos store *(can ship after everything else)*
+### Task 12a — Optional Cosmos store
 - [ ] `host/jobs/store/cosmos.mjs` — the unchanged `STORE_METHODS`, lazily imported, never loaded
-      unless `store.kind === 'cosmos'`
+      unless it is actually selected
 - [ ] Run the **existing shared store-contract suite** against it with no edits to the suite
 - [ ] Skip cleanly when no emulator is present, so CI without Cosmos stays green
+- [ ] **Commit**
+
+### Task 12b — `store.kind: 'auto'`
+- [ ] `host/jobs/store/resolve.mjs` — `auto` → `sqlite` for in-process, `taskhub` for durable
+- [ ] An explicit kind always wins, including `cosmos` on Functions
+- [ ] Unit tests: each backend's resolution; explicit override; unknown kind fails with a clear message
+- [ ] **Commit**
+
+### Task 12c — Retention: archive
+- [ ] `host/retention/archive.mjs` — copy a settled run's history and final record to the archive store
+- [ ] **A failed archive blocks the purge for that record**, is flagged to operators, and retries next pass
+- [ ] Unit tests: copied before clearing; unreachable archive store blocks the clear; retry succeeds;
+      disabled archive is a no-op with no cost
+- [ ] **Commit**
+
+### Task 12d — Retention: expiry and the manual route
+- [ ] `host/retention/expiry.mjs` — eligibility (settled, older than `afterDays`, archived if required)
+- [ ] The bounded paused-run skip: `waiting_input` is skipped only while younger than
+      `expiresAt + graceDays`
+- [ ] `host/retention/routes.mjs` — `POST /jobs/purge` with `dryRun`, mounted only when
+      `mode` is `manual` or `both`
+- [ ] Unit tests: each eligibility rule; `manual` mode clears nothing on a timer; `dryRun` clears
+      nothing but reports; the route is absent under `auto`
 - [ ] **Commit**
 
 ### Task 12 — Azure: purge safety and the sweep
