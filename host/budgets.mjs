@@ -5,12 +5,34 @@ const DEFAULT_PRICING = {
   outputPer1k: 0.015,
 };
 
-export function createBudgets(config = {}) {
+/**
+ * @param {object} config
+ * @param {object} [restoreFrom] a `snapshot()` taken before a pause. Elapsed
+ *   time and token totals continue from it, so a run that waited two days on a
+ *   person does not resume already over its timeout.
+ */
+export function createBudgets(config = {}, restoreFrom = null) {
   const pricing = config.pricing ?? DEFAULT_PRICING;
-  const startTime = Date.now();
-  let iterations = 0;
-  let totalInputTokens = 0;
-  let totalOutputTokens = 0;
+
+  let iterations = restoreFrom?.iterations ?? 0;
+  let totalInputTokens = restoreFrom?.totalInputTokens ?? 0;
+  let totalOutputTokens = restoreFrom?.totalOutputTokens ?? 0;
+
+  // Elapsed time is the tricky one. It is tracked as "time accumulated before
+  // the current running span" plus "time since that span began", so that
+  // pausing simply banks the current span and stops the clock.
+  //
+  // The alternative — a start timestamp and a running total of paused time —
+  // is equivalent but needs both to be restored correctly, and gets one of
+  // them wrong the first time somebody resumes across a restart.
+  let accumulatedMs = restoreFrom?.elapsedMs ?? 0;
+  let spanStart = Date.now();
+  let pausedAt = null;
+
+  function elapsed() {
+    if (pausedAt !== null) return accumulatedMs;
+    return accumulatedMs + (Date.now() - spanStart);
+  }
 
   function record(usage = {}) {
     iterations++;
@@ -24,6 +46,31 @@ export function createBudgets(config = {}) {
     }
   }
 
+  /**
+   * Stop the clock. Time spent waiting on a person is not time the run spent
+   * working, and charging it against `timeoutMs` would mean any question asked
+   * near the end of a budget guarantees a timeout on resume — punishing the
+   * run for having asked.
+   *
+   * Idempotent: pausing an already-paused budget is a no-op, not a reset.
+   */
+  function pause() {
+    if (pausedAt !== null) return;
+    accumulatedMs += Date.now() - spanStart;
+    pausedAt = Date.now();
+  }
+
+  /** Start the clock again. Idempotent on a running budget. */
+  function resume() {
+    if (pausedAt === null) return;
+    pausedAt = null;
+    spanStart = Date.now();
+  }
+
+  function paused() {
+    return pausedAt !== null;
+  }
+
   function snapshot() {
     const totalTokens = totalInputTokens + totalOutputTokens;
     const estimatedCostUsd =
@@ -35,7 +82,7 @@ export function createBudgets(config = {}) {
       totalOutputTokens,
       totalTokens,
       estimatedCostUsd,
-      elapsedMs: Date.now() - startTime,
+      elapsedMs: elapsed(),
     };
   }
 
@@ -56,13 +103,13 @@ export function createBudgets(config = {}) {
       }
     }
     if (typeof config.timeoutMs === 'number') {
-      const elapsed = Date.now() - startTime;
-      if (elapsed >= config.timeoutMs) {
-        return { ok: false, reason: 'timeout', limit: config.timeoutMs, actual: elapsed };
+      const ms = elapsed();
+      if (ms >= config.timeoutMs) {
+        return { ok: false, reason: 'timeout', limit: config.timeoutMs, actual: ms };
       }
     }
     return { ok: true };
   }
 
-  return { check, record, snapshot };
+  return { check, record, snapshot, pause, resume, paused };
 }
