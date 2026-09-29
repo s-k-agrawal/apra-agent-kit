@@ -21,6 +21,10 @@ jobs:
       - run: npm run test:host
       - run: npm run test:phase2
       - run: npm run test:phase4
+      - run: npm run test:human-input
+      # The clone contract (docs/CONTRACT.md) says to run this in CI. It was
+      # not actually wired up until now.
+      - run: node --test tests/kit-conformance.test.mjs
 
   host-integration-tests:
     runs-on: ubuntu-latest
@@ -34,4 +38,4 @@ jobs:
       - name: Run host, run-loop and jobs suites in Docker
         run: |
           docker run --rm apra-agent-kit-ci \
-            sh -c "npm run test:host && npm run test:phase2 && npm run test:phase4"
+            sh -c "npm run test:host && npm run test:phase2 && npm run test:phase4 && npm run test:human-input"
