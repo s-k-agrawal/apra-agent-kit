@@ -7,7 +7,7 @@
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'budget_exceeded']);
 
 export function initialTurn(goal) {
-  return { goal, jobId: null, status: 'submitting', position: null, iteration: 0, plan: null, replans: 0, reviews: [], answer: null, error: null, routedTo: null };
+  return { goal, jobId: null, status: 'submitting', position: null, iteration: 0, plan: null, replans: 0, reviews: [], answer: null, error: null, routedTo: null, pendingInput: null, inputError: null, submittingInput: false };
 }
 
 export function isLive(turn) {
@@ -29,6 +29,21 @@ export function cancelling(turn) {
 // 'cancelling' is sticky until settled; everything else that is live becomes 'running'.
 function liveStatus(turn) {
   return turn.status === 'cancelling' ? 'cancelling' : 'running';
+}
+
+// A run parked on a question is still live - it has not finished, and the
+// composer must stay disabled - but it is not 'running' either: nothing is
+// executing, and telling the user otherwise is a lie they can see through.
+export function isWaitingForInput(turn) {
+  return turn.status === 'waiting_input' && !!turn.pendingInput;
+}
+
+export function inputSubmitting(turn) {
+  return { ...turn, submittingInput: true, inputError: null };
+}
+
+export function inputRejected(turn, { message, fields = null }) {
+  return { ...turn, submittingInput: false, inputError: { message: String(message ?? 'that answer was not accepted'), fields } };
 }
 
 function describeStep(step) {
@@ -119,11 +134,36 @@ export function reduce(turn, event) {
       return { ...next, status: liveStatus(next) };
     case 'progress':
       return reduceProgress(next, event);
+    // The run is parked on a question. The form is rendered from this.
+    case 'input_required':
+      return {
+        ...next,
+        status: 'waiting_input',
+        submittingInput: false,
+        inputError: null,
+        pendingInput: {
+          batchId: event.batchId,
+          questions: Array.isArray(event.questions) ? event.questions : [],
+          askedBy: event.askedBy ?? null,
+          staleAfter: event.staleAfter ?? null,
+          expiresAt: event.expiresAt ?? null,
+        },
+      };
+    // Answered, timed out or cancelled - the form comes down either way. The
+    // run's own status is reported by the events that follow.
+    case 'input_resolved':
+      return {
+        ...next,
+        pendingInput: null,
+        submittingInput: false,
+        inputError: null,
+        status: next.status === 'waiting_input' ? 'running' : next.status,
+      };
     case 'settled': {
       const status = TERMINAL.has(event.status) ? event.status : 'failed';
       const routedTo = event.routedTo ?? next.routedTo;
-      if (status === 'completed') return { ...next, status, answer: event.result ?? null, error: null, routedTo };
-      return { ...next, status, answer: null, error: settledError(event, status), routedTo };
+      if (status === 'completed') return { ...next, status, answer: event.result ?? null, error: null, routedTo, pendingInput: null };
+      return { ...next, status, answer: null, error: settledError(event, status), routedTo, pendingInput: null };
     }
     default:
       return next;

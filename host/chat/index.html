@@ -171,6 +171,28 @@ textarea{resize:none}
 .answer-raw{font:400 12px/1.65 'IBM Plex Mono',monospace;color:var(--text-body);background:var(--bg-subtle);border:1px solid rgba(0,0,0,.1);border-radius:9px;padding:13px;overflow:auto;max-height:400px;white-space:pre-wrap}
 
 /* Error */
+/* Human input: the question a run is parked on. Given the accent border and
+   its own heading because it is the only thing on screen the person can act
+   on, and a form that reads as decorative gets skipped. */
+.hi-card{max-width:580px;border:1px solid var(--accent);border-left-width:3px;border-radius:9px;background:var(--bg-subtle);overflow:hidden}
+.hi-head{padding:10px 14px 8px;background:var(--bg-header);border-bottom:1px solid var(--border-light);font:600 11px/1 'IBM Plex Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--accent-text)}
+.hi-form{padding:14px}
+.hi-q{margin-bottom:14px}
+.hi-q:last-of-type{margin-bottom:10px}
+.hi-prompt{font:400 13.5px/1.55 Archivo,sans-serif;color:var(--fg,inherit);margin-bottom:9px}
+.hi-choices{display:flex;flex-direction:column;gap:7px}
+.hi-choice{display:flex;align-items:flex-start;gap:9px;font:400 13px/1.5 Archivo,sans-serif;cursor:pointer;padding:7px 10px;border:1px solid var(--border-light);border-radius:7px;background:var(--bg-card);transition:border-color .12s ease,background .12s ease}
+.hi-choice:hover{border-color:var(--accent);background:var(--bg-header)}
+.hi-choice input{margin:2px 0 0;accent-color:var(--accent);flex:none}
+.hi-text{width:100%;box-sizing:border-box;margin-top:7px;padding:9px 11px;border:1px solid var(--border-light);border-radius:7px;background:var(--bg-card);font:400 13px/1.5 Archivo,sans-serif;resize:vertical}
+.hi-text:focus{outline:none;border-color:var(--accent)}
+.hi-other{margin-top:6px}
+.hi-actions{display:flex;justify-content:flex-end;padding-top:4px}
+.hi-submit{padding:8px 18px;border:none;border-radius:7px;background:var(--accent);color:#fff;font:600 12.5px Archivo,sans-serif;cursor:pointer;transition:background .12s ease}
+.hi-submit:hover:not(:disabled){background:var(--accent-hover)}
+.hi-submit:disabled{opacity:.55;cursor:default}
+.hi-error{margin:2px 0 10px;padding:9px 11px;border:1px solid rgba(180,28,28,.2);background:#fef2f2;border-radius:7px;font:400 12.5px/1.45 Archivo,sans-serif;color:#b91c1c}
+.hi-field-error{margin-top:6px;font:400 11.5px/1.4 'IBM Plex Mono',monospace;color:#b91c1c}
 .error-card{padding:12px 14px;border:1px solid rgba(180,28,28,.2);background:#fef2f2;border-radius:8px;font:400 12.5px/1.5 Archivo,sans-serif;color:#b91c1c;max-width:580px}
 
 /* Status */
