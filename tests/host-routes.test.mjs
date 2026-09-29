@@ -79,7 +79,7 @@ test('buildRoutes mounts chat routes only when given', async () => {
   const withChat = buildRoutes({ jobs: fakeJobs(), notifier: null, runSync: async () => ({}), mcpRaw: () => {}, runLoopEnabled: true, chatRoutes: { chatPage, chatScript } });
   assert.equal(withChat.chatPage, chatPage); assert.equal(withChat.chatScript, chatScript);
   assert.deepEqual(Object.keys(withChat), [
-    'health', 'kit', 'mcp', 'task', 'jobGet', 'jobCancel', 'jobEvents',
+    'health', 'kit', 'mcp', 'task', 'jobGet', 'jobCancel', 'jobEvents', 'jobInput',
     'chatPage', 'chatScript',
     'memoryStore', 'memoryQuery', 'memoryGet', 'memoryUpdate', 'memoryPromote', 'memoryRemove',
   ]);

@@ -148,12 +148,18 @@ function extractTaskTags(task) {
 export async function executeHostedTask(task, {
   api, activeDispatcher, toolRegistry, runLoopConfig, routerConfig,
   budgetsConfig, guardrailsMod, jobs, signal, onProgress, memory, logger = console,
+  askUser, resumeFrom = null,
 }) {
   const fullTask = { id: task.id ?? `t-${Date.now().toString(36)}`, ...task };
   // Accept a caller-supplied trace id so a run can be correlated with the
   // request that started it; generate one only when the caller has none.
   const traceId = task.traceId ?? `tr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  const budgetsMod = budgetsConfig ? createBudgets(mergeBudgetConfig(budgetsConfig, fullTask)) : null;
+  // A resumed run continues its budget rather than starting a fresh one.
+  // Without this a run could pause and resume indefinitely and never exhaust
+  // anything — the limits would be decorative.
+  const budgetsMod = budgetsConfig
+    ? createBudgets(mergeBudgetConfig(budgetsConfig, fullTask), resumeFrom?.budget ?? null)
+    : null;
   const useRouter = routerConfig?.enabled && !task.strategy;
   let lease;
   try {
@@ -312,54 +318,62 @@ export async function executeHostedTask(task, {
         memory,
         memories,
         conversation: conversationHistory,
+        askUser,
+        resumeFrom,
       });
     }
 
-    if (ccMode === 'store' && task.sessionId && cc) {
-      try {
-        const answerText = typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result ?? null);
-        const turn = await cc.recordTurn(task.sessionId, {
-          goal: task.goal,
-          answer: answerText,
-          status: result.status,
-        });
-        logger.info?.(`conversation turn recorded: ${turn?.id} for session ${task.sessionId}`);
-      } catch (err) {
-        logger.warn?.(`conversation turn record failed: ${err?.message ?? err}`);
-      }
-    }
-
-    if (memory?.learner) {
-      try {
-        const learned = await memory.learner.extract({
-          task: fullTask,
-          history: result.observations ?? result.history ?? [],
-          recalledFacts: memories,
-          fleetApi: pooledApi,
-        });
-        if (onProgress) {
-          try {
-            await onProgress({
-              kind: 'memory_learn',
-              newFacts: (learned.newFacts ?? []).map(r => {
-                const e = r.entry ?? r;
-                return { id: e.id, kind: e.kind, text: e.text, tags: e.tags };
-              }),
-              promotedIds: learned.promotedIds ?? [],
-            });
-          } catch { /* progress is best-effort */ }
+    // None of this applies to a run that merely paused. It has not
+    // finished: recording a conversation turn would log an answer nobody
+    // gave, learning from it would learn from half a run, and clearing the
+    // run-state checkpoint would throw away what the resume needs.
+    if (result.status !== 'paused') {
+      if (ccMode === 'store' && task.sessionId && cc) {
+        try {
+          const answerText = typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result ?? null);
+          const turn = await cc.recordTurn(task.sessionId, {
+            goal: task.goal,
+            answer: answerText,
+            status: result.status,
+          });
+          logger.info?.(`conversation turn recorded: ${turn?.id} for session ${task.sessionId}`);
+        } catch (err) {
+          logger.warn?.(`conversation turn record failed: ${err?.message ?? err}`);
         }
-      } catch (err) {
-        logger.warn?.(`memory learner failed: ${err?.message ?? err}`);
       }
-    }
-    if (memory?.runState) {
-      try {
-        await memory.runState.clear(fullTask.id ?? task.id ?? task.goal);
-      } catch (err) {
-        logger.warn?.(`memory run-state clear failed: ${err?.message ?? err}`);
+
+      if (memory?.learner) {
+        try {
+          const learned = await memory.learner.extract({
+            task: fullTask,
+            history: result.observations ?? result.history ?? [],
+            recalledFacts: memories,
+            fleetApi: pooledApi,
+          });
+          if (onProgress) {
+            try {
+              await onProgress({
+                kind: 'memory_learn',
+                newFacts: (learned.newFacts ?? []).map(r => {
+                  const e = r.entry ?? r;
+                  return { id: e.id, kind: e.kind, text: e.text, tags: e.tags };
+                }),
+                promotedIds: learned.promotedIds ?? [],
+              });
+            } catch { /* progress is best-effort */ }
+          }
+        } catch (err) {
+          logger.warn?.(`memory learner failed: ${err?.message ?? err}`);
+        }
+      }
+      if (memory?.runState) {
+        try {
+          await memory.runState.clear(fullTask.id ?? task.id ?? task.goal);
+        } catch (err) {
+          logger.warn?.(`memory run-state clear failed: ${err?.message ?? err}`);
+        }
       }
     }
     return { taskId: fullTask.id, traceId, routedTo, ...result };

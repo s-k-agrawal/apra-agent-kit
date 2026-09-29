@@ -200,3 +200,141 @@ test('conformance: the kit reports a version', async () => {
   assert.notEqual(info.version, '0.0.0', 'package.json must carry a version for clones to record');
   assert.match(info.version, /^\d+\.\d+\.\d+/);
 });
+
+// ---------------------------------------------------------------------------
+// 8. Human input does not weaken any of the above
+//
+// See docs/CONTRACT.md §4a–4e. These properties fail silently: a clone keeps
+// working and the difference shows up as an action nobody approved, an
+// approval that went to a screen the adopter does not run, or a credential
+// sitting in storage for a week.
+// ---------------------------------------------------------------------------
+
+const {
+  createAskUser, PauseRequested, isHumanInputSignal, capture, restore, rebuildFromHistory,
+} = await import('../host/human-input/index.mjs');
+
+const anApproval = [{ fieldId: 'proceed', kind: 'approval', prompt: 'Go ahead?', required: true }];
+
+test('conformance: approvalCallback outranks askUser', async () => {
+  // Silently rerouting an adopter's approvals to a screen they do not run is
+  // worse than not offering the feature at all.
+  let consulted = false;
+  const askUser = async () => { consulted = true; throw new PauseRequested({ batchId: 'x' }); };
+  const g = createGuardrails({ approvalCallback: async () => 'approve' }, [], executor);
+
+  const res = await g.execute(tool({ reversible: false }), { args: {}, askUser });
+  assert.equal(res.ok, true);
+  assert.equal(consulted, false, 'askUser must not be consulted when a callback exists');
+});
+
+test('conformance: with neither approver, the refusal is exactly what it always was', async () => {
+  const g = createGuardrails({}, [], executor);
+  const res = await g.execute(tool({ reversible: false }), { args: {} });
+  assert.deepEqual(res, { ok: false, error: 'guardrail_denied', reason: 'approval_denied' });
+});
+
+test('conformance: a pause is never converted into a denial', async () => {
+  const g = createGuardrails({}, [], executor);
+  const askUser = createAskUser({ jobId: 'job-1' });
+  let returned = 'not-called';
+  try {
+    returned = await g.execute(tool({ reversible: false }), { args: {}, askUser });
+  } catch (err) {
+    assert.equal(err.name, 'PauseRequested');
+  }
+  assert.equal(returned, 'not-called', 'execute must unwind, not return a refusal');
+});
+
+test('conformance: human-input signals propagate through tool execution', async () => {
+  // Everything between a tool and the run loop turns throws into values. These
+  // three must be re-thrown, or the run carries on past a question nobody
+  // answered - or loops forever on one that can never be asked.
+  const { executeTool } = await import('../host/tools/executor.mjs');
+  const askUser = createAskUser({ jobId: 'job-1' });
+  const t = { name: 'ask', run: ({ askUser: ask }) => ask({ questions: anApproval }) };
+
+  await assert.rejects(
+    () => executeTool(t, { args: {}, askUser }),
+    (err) => {
+      assert.equal(isHumanInputSignal(err), true, 'the marker is what layers in between check');
+      return true;
+    },
+  );
+});
+
+test('conformance: ordinary tool failures are still values', async () => {
+  const { executeTool } = await import('../host/tools/executor.mjs');
+  const res = await executeTool({ name: 'boom', run: () => { throw new Error('nope'); } }, { args: {} });
+  assert.equal(res.ok, false, 'contract 2 still holds');
+});
+
+test('conformance: the approval question never names the tool', async () => {
+  // A question nobody understands trains people to approve reflexively, and
+  // internal structure on a screen is an information-disclosure surface.
+  const g = createGuardrails({}, [], executor);
+  const askUser = createAskUser({ jobId: 'job-1' });
+
+  await assert.rejects(
+    () => g.execute(tool({ name: 'internal_purge_v3', reversible: false }), { args: { row_id: 91 }, askUser }),
+    (err) => {
+      const prompt = err.batch.questions[0].prompt;
+      assert.equal(prompt.includes('internal_purge_v3'), false);
+      assert.equal(prompt.includes('row_id'), false);
+      return true;
+    },
+  );
+});
+
+test('conformance: no credential survives a snapshot', async () => {
+  const snap = capture({
+    jobId: 'job-1',
+    task: { goal: 'g', inputs: { apiKey: 'sk-live-1' } },
+    conversation: [{ headers: { Authorization: 'Bearer abc' } }],
+    observations: [{ result: { refresh_token: 'rt-1' } }],
+    identity: { personId: 'p-1', accessToken: 'eyJ...', cookie: 'sid=abc' },
+  });
+
+  const serialised = JSON.stringify(snap);
+  for (const leak of ['sk-live-1', 'Bearer abc', 'rt-1', 'eyJ...', 'sid=abc']) {
+    assert.equal(serialised.includes(leak), false, `leaked: ${leak}`);
+  }
+  assert.deepEqual(snap.identity, { personId: 'p-1' }, 'identity records who, not the proof');
+});
+
+test('conformance: an incompatible snapshot is refused, not coerced', async () => {
+  // Resuming on a misread plan cursor re-executes work that already happened.
+  const res = restore({ version: 999, jobId: 'job-1' });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'incompatible_version');
+});
+
+test('conformance: a run rebuilds identically from history alone', async () => {
+  const rec = await import('../host/jobs/record.mjs');
+  const at = new Date('2026-09-24T09:00:00Z');
+  const history = [
+    rec.runStartedEntry('job-1', { task: { goal: 'g' }, traceId: 't' }, at),
+    rec.plannedEntry('job-1', { plan: ['a', 'b'] }, at),
+    rec.stepCompletedEntry('job-1', { stepIndex: 0, result: 1, reversible: true }, at),
+  ];
+  const rebuilt = rebuildFromHistory(history, { jobId: 'job-1', now: at });
+
+  assert.equal(rebuilt.plan.cursor, 1, 'completed work is not redone');
+  assert.equal(restore(rebuilt).ok, true, 'and the rebuild is itself a valid snapshot');
+});
+
+test('conformance: history is never ring-buffered', async () => {
+  // ringEvents exists for the size-capped Azure customStatus view. Applying it
+  // to stored history would silently drop the record of what was agreed.
+  const rec = await import('../host/jobs/record.mjs');
+  const history = Array.from({ length: 200 }, (_, i) =>
+    rec.stepCompletedEntry('job-1', { stepIndex: i, result: i, reversible: true }));
+  assert.equal(rec.ringEvents(history, 50).length, 200);
+});
+
+test('conformance: waiting_input is a status but never a terminal one', async () => {
+  const rec = await import('../host/jobs/record.mjs');
+  assert.ok(rec.STATUSES.includes('waiting_input'));
+  assert.equal(rec.TERMINAL_STATUSES.has('waiting_input'), false,
+    'a paused run must not look finished to the notifier, SSE or the store purge');
+});

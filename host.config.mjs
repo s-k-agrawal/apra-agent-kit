@@ -62,9 +62,25 @@ When completing a travel planning task, your done result MUST include:
     },
     dispatch: {
       enabled: true,
-      store: { kind: 'sqlite', dbPath: './jobs.db' },
+      // 'auto' resolves to sqlite here and to the task hub on Functions, so
+      // the same config works on both. dbPath is only used by sqlite.
+      store: { kind: 'auto', dbPath: './jobs.db' },
       concurrency: 2,
       maxQueueSize: 10,
+      retention: {
+        archive: { enabled: false, store: 'cosmos', when: 'on_settle' },
+        expiry: { afterDays: 30, mode: 'auto', graceDays: 1 },
+      },
+    },
+    // On, so the demo can show the agent stopping to ask. `confirm-itinerary`
+    // is irreversible and triggers the approval; `choose-destination` asks a
+    // question of its own when a city name is ambiguous.
+    humanInput: {
+      enabled: true,
+      maxInterruptions: 10,
+      staleAfterMs: 86_400_000,
+      expiresAfterMs: 604_800_000,
+      sweepIntervalMs: 300_000,
     },
     notify: {
       sse: { enabled: true },

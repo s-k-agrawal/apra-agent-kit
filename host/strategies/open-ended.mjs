@@ -22,10 +22,15 @@ export function createOpenEndedStrategy({
   memory,
   memories,
   conversation,
+  askUser = undefined,
+  resumeFrom = null,
 }) {
   const systemPrompt = buildSystemPrompt({ agentName, agentDescription, memories, conversation });
   const toolCatalog = formatTools(tools);
-  const observations = [];
+  // A resumed run picks up the observations it had before it paused, so the
+  // next prompt reads exactly as it would have. Absent `resumeFrom`, this is
+  // the empty array it has always been.
+  const observations = resumeFrom?.observations ? [...resumeFrom.observations] : [];
   let noActionCount = 0;
 
   function remember(observation) {
@@ -42,10 +47,10 @@ export function createOpenEndedStrategy({
       return { ok: false, error: `Tool "${name}" not found in registry.` };
     }
     if (guardrails) {
-      return guardrails.execute(tool, { fleetApi, args, jobs, traceId, workspace });
+      return guardrails.execute(tool, { fleetApi, args, jobs, traceId, workspace, askUser });
     }
     const { executeTool: exec } = await import('../tools/executor.mjs');
-    return exec(tool, { fleetApi, args, jobs, traceId, workspace });
+    return exec(tool, { fleetApi, args, jobs, traceId, workspace, askUser });
   }
 
   async function* iterate() {
@@ -95,5 +100,8 @@ export function createOpenEndedStrategy({
   return {
     iterate,
     history: () => [...observations],
+    // What a pause needs to write down. Open-ended has no plan, so where it
+    // had got to *is* its observations.
+    progress: () => ({ observations: [...observations], plan: null }),
   };
 }

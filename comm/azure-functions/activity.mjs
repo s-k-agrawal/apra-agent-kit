@@ -3,7 +3,9 @@
 // to the jobs backend's SSE subscribers (bypassing the orchestrator) so the
 // chat UI can show tool execution in real time.
 import { executeHostedTask, settleWhenAborted } from '../../host/tasks.mjs';
-import { settleFromRunResult } from '../../host/jobs/record.mjs';
+import { settleFromRunResult, questionAskedEntry } from '../../host/jobs/record.mjs';
+import { createAskUser } from '../../host/human-input/ask.mjs';
+import { capture } from '../../host/human-input/snapshot.mjs';
 
 let factory = null;
 let contextPromise = null;
@@ -21,7 +23,7 @@ export function getHostContext() {
 
 export function createRunTaskActivity({ getClient, pollMs = 2000, getContext = getHostContext }) {
   return async function runTaskActivity(input, context) {
-    const { jobId, task, callbackUrl } = input;
+    const { jobId, task, callbackUrl, resume = null } = input;
     const client = getClient(context);
     const hostCtx = await getContext();
     const controller = new AbortController();
@@ -41,6 +43,26 @@ export function createRunTaskActivity({ getClient, pollMs = 2000, getContext = g
     }, pollMs);
     cancelPoll.unref?.();
 
+    // Human input on Azure. There is no job store here - the task hub is the
+    // store - so a raised question travels back in the activity's return value
+    // and the orchestration completes on it. `resume` carries the answers
+    // already given, seeded by `provideInput` when it started this
+    // orchestration.
+    const humanInput = hostCtx.humanInputConfig ?? null;
+    const askedHistory = [];
+    const askUser = humanInput?.enabled
+      ? createAskUser({
+          jobId,
+          config: humanInput,
+          answered: resume?.answered ?? [],
+          interruptions: resume?.resumeFrom?.interruptions ?? 0,
+          onQuestion: (batch) => {
+            askedHistory.push(questionAskedEntry(jobId, { batch }, new Date()));
+            emit({ type: 'input_required', jobId, at: iso(), batchId: batch.batchId, questions: batch.questions, askedBy: batch.askedBy, staleAfter: batch.staleAfter, expiresAt: batch.expiresAt });
+          },
+        })
+      : undefined;
+
     try {
       const run = await settleWhenAborted(
         executeHostedTask({ ...task, id: jobId }, {
@@ -55,9 +77,31 @@ export function createRunTaskActivity({ getClient, pollMs = 2000, getContext = g
           logger: hostCtx.logger,
           signal: controller.signal,
           onProgress: (progress) => emit({ type: 'progress', jobId, at: iso(), ...progress }),
+          askUser,
+          resumeFrom: resume?.resumeFrom ?? null,
         }),
         controller.signal,
       );
+
+      // A paused run is not a settled one. It returns the state a later
+      // orchestration will rebuild from - which on Azure is the *only* copy,
+      // because there is no store beside the task hub.
+      if (run.status === 'paused' && !controller.signal.aborted) {
+        const history = [...(resume?.history ?? []), ...askedHistory];
+        const snapshot = capture({
+          jobId,
+          traceId: run.traceId ?? null,
+          task,
+          observations: run.progress?.observations ?? [],
+          plan: run.progress?.plan ?? null,
+          budget: run.budget ?? null,
+          interruptions: askUser?.interruptions?.() ?? 0,
+          identity: input.metadata?.identity ?? null,
+          pendingBatchId: run.batchId,
+        });
+        return { status: 'paused', batchId: run.batchId, batch: run.batch, snapshot, history, routedTo: run.routedTo ?? null };
+      }
+
       const settled = settleFromRunResult(run);
       if (controller.signal.aborted && controller.signal.reason === 'cancelled') {
         settled.status = 'cancelled';

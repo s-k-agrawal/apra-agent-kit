@@ -67,6 +67,34 @@ function checkSandbox(args, config) {
   return null;
 }
 
+/**
+ * The question a person is actually shown before an irreversible tool runs.
+ *
+ * The plain-language rule is normative, not stylistic: no identifiers, no tool
+ * names, no parameter names. Two reasons — a question nobody understands
+ * trains people to approve reflexively, and internal structure on a screen is
+ * an information-disclosure surface.
+ *
+ * A tool therefore describes itself. `approvalPrompt` is a function of the
+ * arguments where the sentence depends on them; `description` is the fallback.
+ * The last resort is deliberately vague rather than leaking the tool name.
+ */
+function describeForApproval(tool, args) {
+  if (typeof tool.approvalPrompt === 'function') {
+    const written = tool.approvalPrompt(args);
+    if (typeof written === 'string' && written.trim()) return written.trim();
+  }
+  if (typeof tool.approvalPrompt === 'string' && tool.approvalPrompt.trim()) {
+    return tool.approvalPrompt.trim();
+  }
+  if (typeof tool.description === 'string' && tool.description.trim()) {
+    return `May I go ahead and ${lowerFirst(tool.description.trim().replace(/\.$/, ''))}?`;
+  }
+  return 'This step makes a change that cannot be undone. May I go ahead?';
+}
+
+const lowerFirst = (s) => (s.length > 1 && s[1] === s[1].toLowerCase() ? s[0].toLowerCase() + s.slice(1) : s);
+
 export function createGuardrails(config = {}, tools = [], executor) {
   function gate(tool, args) {
     if (config.validateInputs && tool.inputSchema) {
@@ -97,6 +125,10 @@ export function createGuardrails(config = {}, tools = [], executor) {
   }
 
   async function execute(tool, executorArgs) {
+    // Set when a person approved this call through `askUser`, so the result
+    // can say who let it through rather than only that it ran.
+    let approval = null;
+
     if (config.validateInputs && tool.inputSchema) {
       const result = tool.inputSchema.safeParse(executorArgs.args);
       if (!result.success) {
@@ -115,11 +147,42 @@ export function createGuardrails(config = {}, tools = [], executor) {
     }
 
     if (policy === 'approve') {
-      if (!config.approvalCallback) {
-        return { ok: false, error: 'guardrail_denied', reason: 'approval_denied' };
-      }
-      const decision = await config.approvalCallback({ tool, args: executorArgs.args, context: executorArgs });
-      if (decision !== 'approve') {
+      // Precedence, in order:
+      //   1. approvalCallback — an adopter with their own transport sees no
+      //      change whatsoever from human input being available.
+      //   2. askUser — the durable route: raise a one-question batch and pause.
+      //   3. neither — deny, exactly as before.
+      //
+      // The order matters. Silently switching an adopter who already has a
+      // callback over to the kit's own question flow would reroute their
+      // approvals to a screen they do not run.
+      if (config.approvalCallback) {
+        const decision = await config.approvalCallback({ tool, args: executorArgs.args, context: executorArgs });
+        if (decision !== 'approve') {
+          return { ok: false, error: 'guardrail_denied', reason: 'approval_denied' };
+        }
+      } else if (typeof executorArgs.askUser === 'function') {
+        // This either returns a replayed answer or throws PauseRequested,
+        // which unwinds the run. It is deliberately not caught: a pause is not
+        // a denial, and treating it as one would run the tool's opposite.
+        const answer = await executorArgs.askUser({
+          askedBy: 'guardrail',
+          askedByDetail: tool.name,
+          questions: [{
+            fieldId: 'proceed',
+            kind: 'approval',
+            // Plain language, no identifiers: a question nobody understands
+            // trains people to approve reflexively.
+            prompt: describeForApproval(tool, executorArgs.args),
+            required: true,
+          }],
+        });
+
+        if (answer?.answers?.proceed !== 'approve') {
+          return { ok: false, error: 'guardrail_denied', reason: 'approval_denied', approval: { decision: 'deny', batchId: answer?.batchId ?? null } };
+        }
+        approval = { decision: 'approve', batchId: answer.batchId ?? null };
+      } else {
         return { ok: false, error: 'guardrail_denied', reason: 'approval_denied' };
       }
     }
@@ -133,7 +196,10 @@ export function createGuardrails(config = {}, tools = [], executor) {
       return { ok: false, error: 'guardrail_denied', reason: 'dry_run' };
     }
 
-    return executor(tool, executorArgs);
+    const result = await executor(tool, executorArgs);
+    // Added only when there was one, so a run with no human input in it
+    // produces byte-for-byte the results it always did.
+    return approval ? { ...result, approval } : result;
   }
 
   function dryRun() {

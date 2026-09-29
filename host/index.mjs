@@ -5,7 +5,7 @@ import { buildMcpServer } from '../mcp/server.mjs';
 import { authenticateRequest as defaultAuthenticate } from '../mcp/auth.mjs';
 import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
 import { createPooledFleetApi } from '../pool/pooled-fleet-api.mjs';
-import { loadConfig, resolveChatConfig } from './config.mjs';
+import { loadConfig, resolveChatConfig, resolveHumanInputConfig } from './config.mjs';
 import { extendRegistry, withJobTools, withMemoryTools } from './tools/registry.mjs';
 import { createMemoryModule } from './memory/index.mjs';
 import { executeTool } from './tools/executor.mjs';
@@ -19,6 +19,11 @@ import { createNotifier } from './notify/index.mjs';
 import { buildRoutes } from './routes.mjs';
 import { buildChatRoutes } from './chat/routes.mjs';
 import { createLogger } from './logger.mjs';
+import { supportsHumanInput } from './jobs/interface.mjs';
+import { createQuestionSweep } from './human-input/sweep.mjs';
+import { createRetention, createArchiveStore } from './retention/index.mjs';
+import { buildRetentionRoutes } from './retention/routes.mjs';
+import { kitInfo } from './kit-info.mjs';
 
 const SUPPORTED_ADAPTERS = {
   'express': () => createExpressAdapter(),
@@ -43,7 +48,7 @@ function defaultConfigDir() {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 }
 
-function resolveModules(config, { runLoop, budgets, guardrails, dispatch, notify, chat } = {}) {
+function resolveModules(config, { runLoop, budgets, guardrails, dispatch, notify, chat, humanInput } = {}) {
   return {
     runLoopConfig: runLoop ?? config.modules?.runLoop,
     budgetsConfig: budgets ?? config.modules?.budgets,
@@ -51,6 +56,7 @@ function resolveModules(config, { runLoop, budgets, guardrails, dispatch, notify
     dispatchConfig: dispatch ?? config.modules?.dispatch,
     notifyConfig: notify ?? config.modules?.notify,
     chatOverride: chat ?? null,
+    humanInputOverride: humanInput ?? null,
   };
 }
 
@@ -66,7 +72,8 @@ export async function startHost({
   fleetApi, dispatcher, port, bindHost: bindHostOption, adapter: adapterName, createAdapter,
   env = process.env, registry, configDir, authenticate = defaultAuthenticate,
   runLoop: runLoopOption, budgets: budgetsOption, guardrails: guardrailsOption,
-  dispatch: dispatchOption, notify: notifyOption, chat: chatOption, durableClient = null, getDurableClient = null,
+  dispatch: dispatchOption, notify: notifyOption, chat: chatOption, humanInput: humanInputOption,
+  durableClient = null, getDurableClient = null,
   logger: loggerOption,
 } = {}) {
   const config = await loadConfig(configDir ?? defaultConfigDir(), env);
@@ -110,6 +117,7 @@ export async function startHost({
   const toolRegistry = [...baseRegistry];   // job tools appended below once jobs exists
   const resolved = resolveModules(config, {
     runLoop: runLoopOption, budgets: budgetsOption, guardrails: guardrailsOption, dispatch: dispatchOption, notify: notifyOption, chat: chatOption,
+    humanInput: humanInputOption,
   });
   const phase2 = createPhase2Modules(toolRegistry, resolved);
   const { runLoopEnabled, budgetsConfig, guardrailsMod } = phase2;
@@ -142,6 +150,16 @@ export async function startHost({
     throw new Error(chatProblem);
   }
 
+  // Human input needs somewhere to park a run, so it only engages alongside
+  // dispatch. config.mjs has already warned if the combination is wrong.
+  const humanInputConfig = dispatchEnabled
+    ? (resolved.humanInputOverride
+        ? resolveHumanInputConfig({ ...config.modules.humanInput, enabled: true, ...resolved.humanInputOverride })
+        : (config.modules.humanInput ?? null))
+    : null;
+  let questionSweep = null;
+  let retention = null;
+
   let jobs = null;
   let memory = null;
   const runSync = (task, { signal } = {}) => executeHostedTask(task, {
@@ -149,9 +167,10 @@ export async function startHost({
   });
   // The run loop only observes abort between iterations. A job blocked in
   // executePrompt would otherwise stay `processing` until FORCE_SETTLE (30s).
-  const runJob = (task, { signal, onProgress }) => settleWhenAborted(
+  const runJob = (task, { signal, onProgress, askUser, resumeFrom }) => settleWhenAborted(
     executeHostedTask(task, {
       api, activeDispatcher, toolRegistry, runLoopConfig, routerConfig, budgetsConfig, guardrailsMod, jobs, signal, onProgress, memory, logger,
+      askUser, resumeFrom,
     }),
     signal,
   );
@@ -192,11 +211,42 @@ export async function startHost({
       jobs = await createJobsBackend(dispatchConfig, {
         runJob, notifier, capacity: activeDispatcher.capacity,
         allowHttpCallbacks: notifyConfig.webhook.allowHttp, durableClient, getDurableClient,
+        humanInput: humanInputConfig, kitVersion: (await kitInfo()).version,
       });
       lateJobs.jobs = jobs;
       await jobs.start();
+
+      // The sweep enforces the two deadlines on a question. It only runs when
+      // the feature is on and the backend can act on what it finds.
+      if (humanInputConfig?.enabled && supportsHumanInput(jobs)) {
+        questionSweep = createQuestionSweep({
+          listWaiting: () => jobs.listWaiting(),
+          expireInput: (id) => jobs.expireInput(id),
+          markStale: (id) => jobs.markInputStale(id),
+          intervalMs: humanInputConfig.sweepIntervalMs,
+        });
+        questionSweep.start();
+      }
+
+      // Record retention. Separate from the question sweep on purpose: one
+      // clears settled records after 30 days, the other expires unanswered
+      // questions after 7. Different clocks, different consequences.
+      if (dispatchConfig.retention && typeof jobs.purgeFinishedBefore !== 'function') {
+        const archiveStore = await createArchiveStore(dispatchConfig.retention.archive, { backend: dispatchConfig.backend });
+        if (archiveStore) await archiveStore.open();
+        retention = createRetention({
+          config: dispatchConfig.retention,
+          store: jobs.store ?? null,
+          archiveStore,
+          clear: (id) => jobs.clearRecord?.(id),
+          listAll: () => jobs.listAllRecords?.() ?? [],
+        });
+        if (typeof jobs.listAllRecords === 'function') retention.start();
+        else retention = null;   // a backend that cannot list its records cannot be swept
+      }
       toolRegistry.push(...withJobTools([], jobs));
     } catch (err) {
+      try { questionSweep?.stop(); retention?.stop(); } catch { /* preserve original error */ }
       try { await jobs?.stop({ drainMs: 0 }); } catch { /* preserve original error */ }
       try { await memory?.close(); } catch { /* preserve original error */ }
       try { await ownDispatcher?.close(); } catch { /* preserve original error */ }
@@ -223,7 +273,12 @@ export async function startHost({
   };
 
   const chatRoutes = await buildChatRoutes({ chatConfig, hostName: config.name });
-  const routes = buildRoutes({ jobs, notifier, runSync, mcpRaw, mcpWeb: null, runLoopEnabled, chatRoutes, guardrails: guardrailsMod, memoryRoutes: memory?.routes ?? null });
+  const routes = {
+    ...buildRoutes({ jobs, notifier, runSync, mcpRaw, mcpWeb: null, runLoopEnabled, chatRoutes, guardrails: guardrailsMod, memoryRoutes: memory?.routes ?? null }),
+    // Mounted only when retention.expiry.mode is 'manual' or 'both'. Under
+    // 'auto' the timer owns it, and a second trigger would race it.
+    ...buildRetentionRoutes({ retention }),
+  };
 
   let adapter;
   const listenPort = port ?? config.comm.port;
@@ -234,6 +289,7 @@ export async function startHost({
     await adapter.start({ routes, port: listenPort, host: bindHost, authenticate, mcpServerFactory });
   } catch (err) {
     try { await adapter?.stop(); } catch { /* preserve */ }
+    try { questionSweep?.stop(); retention?.stop(); } catch { /* preserve */ }
     try { await jobs?.stop({ drainMs: 0 }); } catch { /* preserve */ }
     try { await memory?.close(); } catch { /* preserve */ }
     try { await ownDispatcher?.close(); } catch { /* preserve */ }
@@ -273,6 +329,8 @@ export async function startHost({
     closed = true;
     activeDispatcher.beginShutdown();
     await adapter.stop();
+    questionSweep?.stop();
+    retention?.stop();
     await jobs?.stop({ drainMs: dispatchConfig?.drainMs });
     await notifier?.stop();
     try {

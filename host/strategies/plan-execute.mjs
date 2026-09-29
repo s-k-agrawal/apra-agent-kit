@@ -36,11 +36,20 @@ export function createPlanExecuteStrategy({
   memory,
   memories,
   conversation,
+  askUser = undefined,
+  resumeFrom = null,
 }) {
   const systemPrompt = buildSystemPrompt({ agentName, agentDescription, memories, conversation });
   const toolCatalog = formatTools(tools);
-  const observations = [];
+  // Seeded on a resume; the empty array it has always been otherwise. A
+  // run-state checkpoint may append to it further down.
+  const observations = resumeFrom?.observations ? [...resumeFrom.observations] : [];
   const taskKey = task.id ?? task.goal;
+
+  // Where a pause left off, updated as execution advances, so `progress()`
+  // reports the truth at whatever moment the run happens to unwind.
+  let progressPlan = resumeFrom?.plan ?? null;
+  let progressCursor = resumeFrom?.plan?.cursor ?? 0;
 
   function remember(observation) {
     observations.push(observation);
@@ -70,10 +79,10 @@ export function createPlanExecuteStrategy({
       return { ok: false, error: `Tool "${name}" not found in registry.` };
     }
     if (guardrails) {
-      return guardrails.execute(tool, { fleetApi, args, jobs, traceId, workspace });
+      return guardrails.execute(tool, { fleetApi, args, jobs, traceId, workspace, askUser });
     }
     const { executeTool } = await import('../tools/executor.mjs');
-    return executeTool(tool, { fleetApi, args, jobs, traceId, workspace });
+    return executeTool(tool, { fleetApi, args, jobs, traceId, workspace, askUser });
   }
 
   async function* iterate() {
@@ -198,8 +207,22 @@ export function createPlanExecuteStrategy({
       return yield* reviewPlan(revisedPlan);
     }
 
-    // Phase 1: Plan (skipped when a checkpoint already holds a plan)
-    if (!currentPlan) {
+    // Phase 1: Plan — skipped when a run-state checkpoint already holds a
+    // plan, and skipped entirely when resuming from a pause. The plan was made
+    // and reviewed before the run paused; re-planning would discard completed
+    // work and cost another round of prompts for an answer we already have.
+    //
+    // A paused resume and a checkpoint resume are the same shape, so this
+    // feeds the checkpoint's own resumeStart/resumePending rather than running
+    // a second mechanism beside it.
+    if (resumeFrom?.plan?.steps?.length) {
+      currentPlan = { ...resumeFrom.plan, steps: resumeFrom.plan.steps };
+      resumeStart = resumeFrom.plan.cursor ?? 0;
+      resumePending = true;
+      progressPlan = currentPlan;
+      progressCursor = resumeStart;
+      yield { type: 'plan', plan: currentPlan, _replan: false, _resumed: true };
+    } else if (!currentPlan) {
       const planPrompt = buildPlanPrompt({ task, tools: toolCatalog, systemPrompt });
       const planText = await callPrompt('doer', planPrompt);
       yield { type: 'prompt_usage', text: planText };
@@ -225,8 +248,14 @@ export function createPlanExecuteStrategy({
       resumePending = false;
       let restartExecution = false;
 
+      // Only the first pass resumes mid-plan — `start` is zero thereafter. A
+      // replan produces new steps, and new steps are new work: starting one of
+      // those part-way through would skip something that has never run.
+      progressPlan = currentPlan;
+
       for (let i = start; i < steps.length; i++) {
         const step = steps[i];
+        progressCursor = i;
         const idempotencyKey = `${step.tool ?? step.type}-${JSON.stringify(step.args ?? {})}-${i}`;
         if (memory?.runState) {
           try {
@@ -372,6 +401,7 @@ export function createPlanExecuteStrategy({
       if (restartExecution) {
         continue executeLoop;
       }
+      progressCursor = steps.length;
       break executeLoop;
     }
 
@@ -394,5 +424,13 @@ export function createPlanExecuteStrategy({
   return {
     iterate,
     history: () => [...observations],
+    // What a pause needs to write down: the observations so far, and which
+    // step the plan had reached. The cursor points at the step that was being
+    // attempted, so a resume retries it rather than skipping it — the pause
+    // happened *before* it completed.
+    progress: () => ({
+      observations: [...observations],
+      plan: progressPlan ? { steps: progressPlan.steps, cursor: progressCursor } : null,
+    }),
   };
 }
