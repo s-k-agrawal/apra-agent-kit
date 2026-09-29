@@ -5,8 +5,8 @@ import { pathToFileURL } from 'node:url';
 import { resolveDispatchConfig, resolveNotifyConfigWithEnv } from './jobs/config.mjs';
 
 const SUPPORTED_ADAPTERS = new Set(['express', 'raw-http', 'azure-functions']);
-const KNOWN_MODULES = new Set(['runLoop', 'memory', 'budgets', 'guardrails', 'evals', 'dispatch', 'notify', 'chat', 'router']);
-const IMPLEMENTED_MODULES = new Set(['runLoop', 'budgets', 'guardrails', 'dispatch', 'notify', 'chat', 'router']);
+const KNOWN_MODULES = new Set(['runLoop', 'memory', 'budgets', 'guardrails', 'evals', 'dispatch', 'notify', 'chat', 'router', 'humanInput']);
+const IMPLEMENTED_MODULES = new Set(['runLoop', 'budgets', 'guardrails', 'dispatch', 'notify', 'chat', 'router', 'humanInput']);
 
 export async function loadConfig(configDir, env = process.env) {
   const raw = await resolveConfig(configDir);
@@ -161,6 +161,18 @@ function validate(raw, env) {
   if (notify.webhook.allowHttp) console.warn('[host/config] notify.webhook.allowHttp is on — plain-http callback URLs are accepted');
   modules.notify = notify;
 
+  const humanInput = resolveHumanInputConfig(modules.humanInput, { env });
+  if (humanInput.enabled && !modules.dispatch?.enabled) {
+    // A warning, not an error. There is nowhere to park a run on the
+    // synchronous `/task?wait=true` path, so the feature simply does not
+    // engage and guardrails behave exactly as they do today -- which is safe,
+    // just not what the adopter asked for.
+    console.warn(
+      '[host/config] humanInput enabled but dispatch disabled - there is nowhere to park a paused run; guardrails will deny irreversible tools as before',
+    );
+  }
+  modules.humanInput = humanInput;
+
   const chat = resolveChatConfig(modules.chat, { env, name: raw.name });
   if (chat.enabled) {
     if (!modules.dispatch?.enabled) {
@@ -184,4 +196,45 @@ function validate(raw, env) {
     }),
     modules: Object.freeze(modules),
   });
+}
+
+// Defaults for durable human input. Off unless asked for: a kit that started
+// stopping runs to ask questions the moment it was cloned would be a surprise,
+// and every one of these numbers is a policy decision an adopter should make
+// deliberately.
+export const HUMAN_INPUT_DEFAULTS = Object.freeze({
+  enabled: false,
+  maxInterruptions: 10,          // counted in interruptions, not questions
+  staleAfterMs: 86_400_000,      // 24h - soft: warn on resume
+  expiresAfterMs: 604_800_000,   // 7d  - hard: treated as refused
+  sweepIntervalMs: 300_000,
+});
+
+export function resolveHumanInputConfig(raw, { env = {} } = {}) {
+  const enabledEnv = env.HUMAN_INPUT_ENABLED;
+  const enabled = enabledEnv === undefined
+    ? !!(raw?.enabled ?? HUMAN_INPUT_DEFAULTS.enabled)
+    : ['1', 'true', 'yes'].includes(String(enabledEnv).toLowerCase());
+
+  const out = { ...HUMAN_INPUT_DEFAULTS, ...(raw ?? {}), enabled };
+
+  // A limit of zero means every question is one too many, which is a run that
+  // can never ask anything - almost certainly a typo for "off".
+  if (!(Number.isInteger(out.maxInterruptions) && out.maxInterruptions > 0)) {
+    throw new Error(`humanInput.maxInterruptions must be a positive integer (got ${out.maxInterruptions})`);
+  }
+  for (const key of ['staleAfterMs', 'expiresAfterMs', 'sweepIntervalMs']) {
+    if (!(Number.isFinite(out[key]) && out[key] > 0)) {
+      throw new Error(`humanInput.${key} must be a positive number of milliseconds (got ${out[key]})`);
+    }
+  }
+  // A hard deadline inside the soft one means every question is expired before
+  // it is ever merely stale, and the warning never fires.
+  if (out.expiresAfterMs <= out.staleAfterMs) {
+    throw new Error(
+      `humanInput.expiresAfterMs (${out.expiresAfterMs}) must be greater than staleAfterMs (${out.staleAfterMs})`,
+    );
+  }
+
+  return Object.freeze(out);
 }
