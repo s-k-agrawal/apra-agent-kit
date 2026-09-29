@@ -174,6 +174,8 @@ record.
   plan: { steps: [...], cursor: 3 },
   observations: [ /* what the strategies carry today */ ],
   budget: { iterations, totalInputTokens, totalOutputTokens, elapsedMs },
+  interruptions: 2,              // batches raised so far — MUST persist, or maxInterruptions
+                                 // resets on every resume and never trips
   identity: { personId, tenantId? },   // who the work is for — never a credential
   pendingBatchId: 'inp-a3f19c284d61',
 }
@@ -403,7 +405,17 @@ it had asked and been refused — that executes something nobody declined.
 ### Resuming
 
 1. Validate the answer against the batch.
-2. Conditional write of `answer_received`, keyed on `batchId` — first writer wins.
+2. Append `answer_received`. The guard is the **status transition itself**: an answer is accepted
+   only while the job is `waiting_input` and the batch id matches, so a second answer for the same
+   batch finds the job already `processing` and is refused with `409`. No compare-and-set and no new
+   store method — `STORE_METHODS` stays unchanged.
+
+   *Limitation, stated rather than hidden:* read-then-write is not atomic across processes, so two
+   instances answering the same batch in the same instant could both proceed. That cannot happen in
+   the shipped configuration — one chat has one user, and `dispatch.concurrency` defaults to 1 — and
+   the realistic races (a double-click, a client retry) are all single-process and handled by the
+   status check. If the kit later runs several instances answering concurrently, this needs a
+   conditional write modelled on the existing `claim`.
 3. Clear `pendingInput`; delete the `pending` row; transition to `processing`.
 4. Enqueue a resume.
 5. A worker acquires a **fresh** lease, loads the snapshot (or rebuilds from history), appends the
@@ -685,7 +697,7 @@ host/human-input/
 | `host/jobs/durable.mjs` | purge skips live paused instances (`waiting_input` younger than `expiresAt + graceDays`) |
 | `host/tasks.mjs` | inject `askUser`; wrap it in budget `pause`/`resume`; handle the `paused` return |
 | `host/run-loop.mjs` | thread `askUser`; return `{ status: 'paused', … }` instead of blocking |
-| `host/strategies/*.mjs` | pass `askUser` on `executorArgs`; propagate a pause; accept an answer as an observation and allow a replan |
+| `host/strategies/*.mjs` | pass `askUser` on `executorArgs`; propagate a pause; accept an answer as an observation and allow a replan; **an optional `resumeFrom` seeds observations, plan and cursor** — absent means today's behaviour exactly |
 | `host/guardrails.mjs` | prefer `approvalCallback`, fall back to `askUser`; unchanged when neither is present |
 | `host/budgets.mjs` | `pause()` / `resume()` / `paused()`; elapsed excludes paused time; restore from snapshot |
 | `host/routes.mjs` | `POST /jobs/:id/input`; `pendingInput` and `stale` on `GET /jobs/:id` |
