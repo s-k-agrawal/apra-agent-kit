@@ -21,6 +21,8 @@ export async function runTask(task, {
   agentDescription,
   onIteration,
   traceId,
+  askUser,
+  resumeFrom = null,
 } = {}) {
   // One id for the whole run, threaded into every tool call so a result in a
   // downstream system can be traced back to the plan that produced it.
@@ -33,6 +35,7 @@ export async function runTask(task, {
     maxReplanAttempts, maxReviewAttempts, maxStepReviewAttempts,
     maxNoActionTurns, minReviewPolicy, agentName, agentDescription,
     traceId: runTraceId,
+    askUser, resumeFrom,
   };
 
   const strat = strategy === 'plan-execute'
@@ -42,6 +45,7 @@ export async function runTask(task, {
   let result = null;
   let status = 'failed';
   let iteration = 0;
+  let pausedBatch = null;
 
   try {
     for await (const event of strat.iterate()) {
@@ -85,21 +89,51 @@ export async function runTask(task, {
   } catch (err) {
     if (err?.name === 'AbortError') {
       status = 'cancelled';
+    } else if (err?.name === 'PauseRequested') {
+      // Not a failure. The run asked a person something and unwound so the
+      // worker lease can be released; the caller persists and returns.
+      status = 'paused';
+      pausedBatch = err.batch;
+      result = null;
+    } else if (err?.name === 'TooManyInterruptions') {
+      status = 'failed';
+      result = { error: 'too_many_interruptions', message: err.message, limit: err.limit, actual: err.actual };
+    } else if (err?.name === 'InvalidQuestion') {
+      // A question nobody could answer. Failing is the only honest outcome —
+      // continuing would mean proceeding past an approval that was never given.
+      status = 'failed';
+      result = { error: 'invalid_question', message: err.message };
     } else {
       status = 'failed';
       result = { error: 'unexpected', message: String(err?.message ?? err) };
     }
   }
 
+  // Stop the budget clock before the snapshot is taken, not after. Time spent
+  // waiting on a person is not time the run spent working, and anything that
+  // happens between here and the persist — a slow store write, a retry — would
+  // otherwise be charged against `timeoutMs` on resume.
+  if (status === 'paused') budgets?.pause?.();
+
   const history = strat.history().map(o =>
     o.type === 'observation' && o.result?.error ? { ...o, ...o.result } : o,
   );
 
-  return {
+  const out = {
     status,
     result,
     history,
     traceId: runTraceId,
     budget: budgets?.snapshot() ?? null,
   };
+
+  if (status === 'paused') {
+    out.batchId = pausedBatch.batchId;
+    out.batch = pausedBatch;
+    // The strategy's own view of where it had got to. The caller turns this
+    // into a snapshot; history remains the thing it can be rebuilt from.
+    out.progress = strat.progress?.() ?? null;
+  }
+
+  return out;
 }

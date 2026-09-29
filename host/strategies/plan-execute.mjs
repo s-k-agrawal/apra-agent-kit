@@ -33,10 +33,17 @@ export function createPlanExecuteStrategy({
   agentName = 'agent',
   agentDescription = '',
   traceId = null,
+  askUser = undefined,
+  resumeFrom = null,
 }) {
   const systemPrompt = buildSystemPrompt({ agentName, agentDescription });
   const toolCatalog = formatTools(tools);
-  const observations = [];
+  // Seeded on a resume; the empty array it has always been otherwise.
+  const observations = resumeFrom?.observations ? [...resumeFrom.observations] : [];
+  // Where a pause left off, updated as execution advances, so `progress()`
+  // reports the truth at whatever moment the run happens to unwind.
+  let progressPlan = resumeFrom?.plan ?? null;
+  let progressCursor = resumeFrom?.plan?.cursor ?? 0;
 
   function shouldReview(step) {
     if (step.review) return true;
@@ -58,10 +65,10 @@ export function createPlanExecuteStrategy({
       return { ok: false, error: `Tool "${name}" not found in registry.` };
     }
     if (guardrails) {
-      return guardrails.execute(tool, { fleetApi, args, jobs, traceId, workspace });
+      return guardrails.execute(tool, { fleetApi, args, jobs, traceId, workspace, askUser });
     }
     const { executeTool } = await import('../tools/executor.mjs');
-    return executeTool(tool, { fleetApi, args, jobs, traceId, workspace });
+    return executeTool(tool, { fleetApi, args, jobs, traceId, workspace, askUser });
   }
 
   async function* iterate() {
@@ -143,31 +150,50 @@ export function createPlanExecuteStrategy({
       return yield* reviewPlan(revisedPlan);
     }
 
-    // Phase 1: Plan
-    const planPrompt = buildPlanPrompt({ task, tools: toolCatalog, systemPrompt });
-    const planText = await callPrompt('doer', planPrompt);
-    yield { type: 'prompt_usage', text: planText };
-    const planParsed = parseResponse(planText);
+    // Phase 1: Plan — skipped entirely on a resume. The plan was made, and
+    // reviewed, before the run paused; re-planning would discard completed
+    // work and cost another round of prompts for an answer we already have.
+    let resumeAt = 0;
+    if (resumeFrom?.plan?.steps?.length) {
+      currentPlan = { ...resumeFrom.plan, steps: resumeFrom.plan.steps };
+      resumeAt = resumeFrom.plan.cursor ?? 0;
+      progressPlan = currentPlan;
+      progressCursor = resumeAt;
+      yield { type: 'plan', plan: currentPlan, _replan: false, _resumed: true };
+    } else {
+      const planPrompt = buildPlanPrompt({ task, tools: toolCatalog, systemPrompt });
+      const planText = await callPrompt('doer', planPrompt);
+      yield { type: 'prompt_usage', text: planText };
+      const planParsed = parseResponse(planText);
 
-    if (planParsed.type !== 'plan') {
-      yield { type: 'error', reason: 'invalid_plan', message: 'Doer did not produce a plan block' };
-      return;
+      if (planParsed.type !== 'plan') {
+        yield { type: 'error', reason: 'invalid_plan', message: 'Doer did not produce a plan block' };
+        return;
+      }
+
+      currentPlan = planParsed.payload;
+      yield { type: 'plan', plan: currentPlan, _replan: false };
+
+      const reviewedPlan = yield* reviewPlan(currentPlan);
+      if (!reviewedPlan) return;
+      currentPlan = reviewedPlan;
     }
-
-    currentPlan = planParsed.payload;
-    yield { type: 'plan', plan: currentPlan, _replan: false };
-
-    const reviewedPlan = yield* reviewPlan(currentPlan);
-    if (!reviewedPlan) return;
-    currentPlan = reviewedPlan;
 
     // Phase 3: Execute steps (restarts from the beginning after step-review replan)
     executeLoop: while (true) {
       const steps = currentPlan.steps;
       let restartExecution = false;
 
-      for (let i = 0; i < steps.length; i++) {
+      // Only the first pass resumes mid-plan. A replan produces new steps, and
+      // new steps are new work — starting one of those part-way through would
+      // skip something that has never run.
+      const from = resumeAt;
+      resumeAt = 0;
+      progressPlan = currentPlan;
+
+      for (let i = from; i < steps.length; i++) {
         const step = steps[i];
+        progressCursor = i;
 
         if (step.type === 'tool') {
           let args = step.args;
@@ -301,6 +327,7 @@ export function createPlanExecuteStrategy({
       if (restartExecution) {
         continue executeLoop;
       }
+      progressCursor = steps.length;
       break executeLoop;
     }
 
@@ -323,5 +350,13 @@ export function createPlanExecuteStrategy({
   return {
     iterate,
     history: () => [...observations],
+    // What a pause needs to write down: the observations so far, and which
+    // step the plan had reached. The cursor points at the step that was being
+    // attempted, so a resume retries it rather than skipping it — the pause
+    // happened *before* it completed.
+    progress: () => ({
+      observations: [...observations],
+      plan: progressPlan ? { steps: progressPlan.steps, cursor: progressCursor } : null,
+    }),
   };
 }

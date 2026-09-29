@@ -143,12 +143,18 @@ export function mergeBudgetConfig(baseConfig, task) {
 export async function executeHostedTask(task, {
   api, activeDispatcher, toolRegistry, runLoopConfig, routerConfig,
   budgetsConfig, guardrailsMod, jobs, signal, onProgress,
+  askUser, resumeFrom = null,
 }) {
   const fullTask = { id: task.id ?? `t-${Date.now().toString(36)}`, ...task };
   // Accept a caller-supplied trace id so a run can be correlated with the
   // request that started it; generate one only when the caller has none.
   const traceId = task.traceId ?? `tr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  const budgetsMod = budgetsConfig ? createBudgets(mergeBudgetConfig(budgetsConfig, fullTask)) : null;
+  // A resumed run continues its budget rather than starting a fresh one.
+  // Without this a run could pause and resume indefinitely and never exhaust
+  // anything — the limits would be decorative.
+  const budgetsMod = budgetsConfig
+    ? createBudgets(mergeBudgetConfig(budgetsConfig, fullTask), resumeFrom?.budget ?? null)
+    : null;
   const useRouter = routerConfig?.enabled && !task.strategy;
   let lease;
   try {
@@ -246,6 +252,8 @@ export async function executeHostedTask(task, {
       signal: combined.signal,
       workspace,
       onIteration: onProgress,
+      askUser,
+      resumeFrom,
     });
     return { taskId: fullTask.id, traceId, routedTo, ...result };
   } finally {
