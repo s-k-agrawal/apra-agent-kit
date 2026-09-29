@@ -56,6 +56,31 @@ export function buildOrchestrator({ ringSize = 50 } = {}) {
     const output = yield df.callActivity(ACTIVITY_NAME, { ...input, jobId });
 
     const at = nowIso();
+
+    // A pause ends the orchestration. It does not wait.
+    //
+    // `waitForExternalEvent` is the obvious alternative and it is the wrong
+    // one twice over: the replay bug documented above returns the moment this
+    // generator yields more than once, and an orchestration parked on an event
+    // is billed and replayed for as long as the person takes. Instead the
+    // orchestration *completes*, its output carries the state, and answering
+    // starts a new one. See host/jobs/durable.mjs provideInput().
+    if (output.status === 'paused') {
+      state.status = 'waiting_input';
+      state.finishedAt = null;
+      // Small on purpose. customStatus has a hard size limit and is a live
+      // view, never a source of truth - the state is in the output.
+      state.pendingInput = {
+        batchId: output.batchId,
+        askedBy: output.batch?.askedBy ?? null,
+        staleAfter: output.batch?.staleAfter ?? null,
+        expiresAt: output.batch?.expiresAt ?? null,
+      };
+      push({ type: 'input_required', jobId, at, batchId: output.batchId, questions: output.batch?.questions ?? [], askedBy: output.batch?.askedBy ?? null, staleAfter: output.batch?.staleAfter ?? null, expiresAt: output.batch?.expiresAt ?? null });
+      publish();
+      return guardPausedOutput(output, jobId);
+    }
+
     state.status = output.status;
     state.finishedAt = at;
     push({ type: 'settled', jobId, at, status: output.status, result: output.result ?? null, error: output.error ?? null });
@@ -65,3 +90,29 @@ export function buildOrchestrator({ ringSize = 50 } = {}) {
 }
 
 export const runTaskOrchestrator = buildOrchestrator();
+
+/**
+ * A paused orchestration's output is the only copy of its state, so it must
+ * never be truncated the way a finished result can be.
+ *
+ * Durable caps a return value at 16 KB (UTF-16). If the state does not fit,
+ * the honest outcome is to fail the run rather than write a snapshot that will
+ * rebuild into something wrong. The message names the fix, because there is
+ * one: an explicit store on Functions keeps state outside the task hub.
+ */
+function guardPausedOutput(output, jobId) {
+  const json = JSON.stringify(output);
+  if (json.length <= DURABLE_PAYLOAD_MAX_CHARS) return output;
+
+  return {
+    status: 'failed',
+    result: null,
+    error: {
+      code: 'pause_too_large',
+      message:
+        `job ${jobId} could not pause: its state is ${json.length} characters and Durable caps an ` +
+        'orchestration output at roughly 12,000. Set dispatch.store.kind to "cosmos" to keep job ' +
+        'state outside the task hub.',
+    },
+  };
+}
