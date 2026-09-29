@@ -78,5 +78,5 @@ test('buildRoutes mounts chat routes only when given', async () => {
   const chatScript = { method: 'GET', path: '/chat/app.mjs', auth: false, handler: async () => ({ status: 200, text: 'y' }) };
   const withChat = buildRoutes({ jobs: fakeJobs(), notifier: null, runSync: async () => ({}), mcpRaw: () => {}, runLoopEnabled: true, chatRoutes: { chatPage, chatScript } });
   assert.equal(withChat.chatPage, chatPage); assert.equal(withChat.chatScript, chatScript);
-  assert.deepEqual(Object.keys(withChat), ['health', 'kit', 'mcp', 'task', 'jobGet', 'jobCancel', 'jobEvents', 'chatPage', 'chatScript']);
+  assert.deepEqual(Object.keys(withChat), ['health', 'kit', 'mcp', 'task', 'jobGet', 'jobCancel', 'jobEvents', 'jobInput', 'chatPage', 'chatScript']);
 });

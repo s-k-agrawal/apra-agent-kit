@@ -1,4 +1,4 @@
-import { JobQueueFullError, JobsClosedError, InvalidCallbackUrlError } from './jobs/interface.mjs';
+import { JobQueueFullError, JobsClosedError, InvalidCallbackUrlError, supportsHumanInput } from './jobs/interface.mjs';
 import { kitInfo } from './kit-info.mjs';
 
 const json = (status, body, headers) => ({ status, body, ...(headers ? { headers } : {}) });
@@ -25,7 +25,7 @@ export function buildRoutes({ jobs, notifier, runSync, mcpRaw, mcpWeb, runLoopEn
       }),
     },
     mcp: { method: 'POST', path: '/mcp', raw: true, handler: mcpRaw, web: mcpWeb },
-    task: null, jobGet: null, jobCancel: null, jobEvents: null,
+    task: null, jobGet: null, jobCancel: null, jobEvents: null, jobInput: null,
     chatPage: chatRoutes?.chatPage ?? null, chatScript: chatRoutes?.chatScript ?? null,
   };
 
@@ -57,13 +57,45 @@ export function buildRoutes({ jobs, notifier, runSync, mcpRaw, mcpWeb, runLoopEn
   }
 
   if (jobs) {
+    const humanInput = supportsHumanInput(jobs);
+
     routes.jobGet = {
       method: 'GET', path: '/jobs/:id',
       handler: async ({ params }) => {
         const record = await jobs.get(params.id);
-        return record ? json(200, record) : json(404, { ok: false, error: 'not_found' });
+        if (!record) return json(404, { ok: false, error: 'not_found' });
+        if (!humanInput) return json(200, record);
+
+        // `pendingInput` and `stale` are added rather than nested so a client
+        // that knows nothing about human input reads the record it always did.
+        const pending = await jobs.pendingInput(params.id);
+        return json(200, { ...record, pendingInput: pending ?? null, stale: pending?.stale ?? false });
       },
     };
+
+    if (humanInput) {
+      routes.jobInput = {
+        method: 'POST', path: '/jobs/:id/input',
+        handler: async ({ params, body, user }) => {
+          const submission = body ?? {};
+          if (typeof submission.batchId !== 'string' || !submission.batchId) {
+            return json(400, { ok: false, error: 'validation_failed', fields: { batchId: 'required' } });
+          }
+
+          // The answer is attributed to the authenticated caller, never to
+          // whatever the body claims. A batch id is not a capability.
+          const identity = user?.id ? { personId: user.id } : null;
+          const out = await jobs.provideInput(params.id, submission, { identity });
+
+          if (out.ok) return json(200, { ok: true, status: out.status, stale: out.stale, batchId: out.batchId });
+
+          // `code` and its HTTP status travel together from `REFUSALS`, so a
+          // new refusal cannot be added without deciding what it means here.
+          const { code, status, ok, ...detail } = out;
+          return json(status ?? 409, { ok: false, error: code, ...detail });
+        },
+      };
+    }
     routes.jobCancel = {
       method: 'DELETE', path: '/jobs/:id',
       handler: async ({ params }) => {
