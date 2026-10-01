@@ -33,6 +33,17 @@ const api = {
     }
     throw new Error(`job ${jobId} never reached processing`);
   },
+  async waitWaiting(jobId) {
+    for (let i = 0; i < 900; i++) {
+      const r = await api.get(`/jobs/${jobId}`);
+      if (r.body?.status === 'waiting_input') return r.body;
+      if (['completed', 'failed', 'cancelled'].includes(r.body?.status)) {
+        throw new Error(`job ${jobId} settled ${r.body.status} without ever asking`);
+      }
+      await sleep(100);
+    }
+    throw new Error(`job ${jobId} never reached waiting_input`);
+  },
 };
 
 const summary = [];
@@ -51,7 +62,31 @@ for (const file of scenarioFiles) {
     const { jobId, links } = sub.body;
     assert.equal(links.events, `/jobs/${jobId}/events`);
 
-    const events = await api.follow(jobId);
+    // A paused run emits no `settled`, so the follow would block until the
+    // question is answered. Start it first, then answer, then collect.
+    const following = api.follow(jobId);
+
+    if (s.humanInput) {
+      const parked = await api.waitWaiting(jobId);
+      assert.ok(parked.pendingInput, 'the batch is on the record');
+      assert.equal(parked.pendingInput.askedBy, s.humanInput.expectAskedBy);
+      assert.equal(parked.pendingInput.questions[0].kind, s.humanInput.expectKind);
+      assert.equal(parked.pendingInput.questions[0].prompt.includes(s.expectedTools[0]), false,
+        'no tool name reaches the person');
+
+      // The load-bearing assertion for the checkpoint change: the job record
+      // carries a pointer, and the state lives in the checkpoint store.
+      assert.equal(parked.snapshot, undefined, 'no run state on the job record');
+      assert.ok(parked.pendingBatchId, 'a pointer is on the job record');
+
+      const answered = await api.post(`/jobs/${jobId}/input`, {
+        batchId: parked.pendingInput.batchId,
+        answers: s.humanInput.answer,
+      });
+      assert.equal(answered.status, 200, JSON.stringify(answered.body));
+    }
+
+    const events = await following;
     const types = events.map(e => e.event);
     assert.equal(types.at(-1), 'settled');
     assert.ok(types.includes('started'), `expected started in ${types}`);
@@ -67,6 +102,13 @@ for (const file of scenarioFiles) {
     assert.ok(Array.isArray(rec.history));
     const toolsSeen = new Set(rec.history.filter(h => h.tool).map(h => h.tool));
     for (const tool of s.expectedTools) assert.ok(toolsSeen.has(tool), `expected tool ${tool} in history; saw ${[...toolsSeen]}`);
+    if (s.humanInput?.expectResultMatches) {
+      const text = typeof rec.result === 'string' ? rec.result : JSON.stringify(rec.result);
+      assert.match(text, new RegExp(s.humanInput.expectResultMatches));
+      // The tool ran once across the pause, not once per run.
+      const ran = rec.history.filter(h => h.tool === s.expectedTools[0]);
+      assert.equal(ran.length, 1, `${s.expectedTools[0]} ran ${ran.length} times across the pause`);
+    }
     summary.push({ scenario: s.id, status: rec.status, iterations: rec.budget?.iterations ?? null, tokens: rec.budget?.totalTokens ?? null, costUsd: rec.budget?.estimatedCostUsd ?? null, wallMs: Date.now() - t0 });
   });
 }

@@ -209,7 +209,7 @@ knows, what tools to use, and any domain-specific rules.`,
     // Memory (all tiers optional — uncomment what you need)
     // memory: {
     //   conversationContext: { enabled: true, mode: 'store', store: 'sqlite', dbPath: './memory/conversation.db' },
-    //   runState: { enabled: true, store: 'sqlite', dbPath: './memory/run-state.db' },
+    //   checkpoint: { enabled: true, store: 'sqlite', dbPath: './memory/checkpoint.db' },
     //   longTerm: { enabled: true, store: 'sqlite', dbPath: './memory/memory.db', autoLearn: true },
     // },
   },
@@ -427,7 +427,7 @@ and 25 LLM iterations. You can override these per-request or in config. A typica
 travel briefing costs around $0.50-1.00.
 
 **Q: What happens if the agent crashes mid-task?**
-With run-state memory enabled, the agent resumes from the last checkpoint on restart. The
+With checkpoint memory enabled, the agent resumes from the last checkpoint on restart. The
 in-process job backend also re-queues any `queued` jobs and fails stale `processing` jobs.
 
 **Q: Can I run multiple agents?**

@@ -9,6 +9,7 @@ import { runDestinationOverview } from '../workflows/destination-overview/main.m
 import { runTravelPrep } from '../workflows/travel-prep/main.mjs';
 import { runRouteCheck } from '../workflows/route-check/main.mjs';
 import { runTripPlanner } from '../workflows/trip-planner/main.mjs';
+import { humanInputDemoTools } from './human-input-tools.mjs';
 
 // Routable workflows. To expose a new tool, append an entry here — no changes to
 // server.mjs or http.mjs are needed. `description` is read by the connected
@@ -438,4 +439,8 @@ export const defaultRegistry = [
       return parseToolOutput(raw);
     },
   },
+  // Demo tools for durable human input. Delete these when adopting the kit -
+  // they exist so the travel agent has something to ask about, since every
+  // other tool here is read-only.
+  ...humanInputDemoTools,
 ];

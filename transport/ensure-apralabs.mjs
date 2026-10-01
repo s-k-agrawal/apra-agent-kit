@@ -44,6 +44,60 @@ function findApralabsSource() {
   return null;
 }
 
+/**
+ * Copy a package's missing dependencies out of a global install.
+ *
+ * npm hoists: a package's dependencies normally sit in the root `node_modules`,
+ * not inside the package. So copying a package directory alone produces one
+ * that cannot resolve its own imports — the failure surfaces much later, as
+ * `Cannot find package 'ajv' imported from .../apra-fleet-workflow/...`.
+ *
+ * Only what is actually declared is copied, and only when it is missing.
+ * Copying the whole global tree would also work and would be wrong: it is slow,
+ * and it can shadow versions npm resolved deliberately.
+ *
+ * Best effort throughout. Fleet is optional, and a dependency that cannot be
+ * found degrades the workflow tests rather than taking down a host that was
+ * starting perfectly well without Fleet at all.
+ *
+ * @param {string} pkgDir      the copied package, in the destination tree
+ * @param {string} globalRoot  the global `node_modules` to copy from
+ * @param {string} destRoot    the destination `node_modules`
+ */
+export function copyMissingDeps(pkgDir, globalRoot, destRoot, seen = new Set()) {
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'));
+  } catch {
+    return;   // no manifest, nothing declared, nothing to do
+  }
+
+  for (const name of Object.keys(manifest.dependencies ?? {})) {
+    if (seen.has(name)) continue;    // a -> b -> a would otherwise recurse forever
+    seen.add(name);
+
+    const dest = path.join(destRoot, name);
+    // Already there: npm resolved it, and we are filling gaps rather than
+    // taking over. Overwriting could downgrade something the lockfile pinned.
+    if (fs.existsSync(dest)) continue;
+
+    // Nested first — npm puts a dependency there when the hoisted version
+    // conflicts, and that copy is the one this package is meant to see.
+    const nested = path.join(pkgDir, 'node_modules', name);
+    const hoisted = path.join(globalRoot, name);
+    const src = fs.existsSync(nested) ? nested : hoisted;
+    if (!fs.existsSync(src)) continue;
+
+    try {
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.cpSync(src, dest, { recursive: true });
+      copyMissingDeps(dest, globalRoot, destRoot, seen);
+    } catch {
+      // Leave it; the import that needs it will say so more usefully than we can.
+    }
+  }
+}
+
 export function ensureApralabs() {
   const destDir = path.join(repoRoot, 'node_modules');
   const scopeDest = path.join(destDir, '@apralabs');
@@ -83,7 +137,12 @@ export function ensureApralabs() {
         allPresent = false;
         const srcPkg = path.join(src.scope, pkg);
         if (fs.existsSync(srcPkg)) {
-          fs.cpSync(srcPkg, path.join(scopeDest, pkg), { recursive: true });
+          const pkgDest = path.join(scopeDest, pkg);
+          fs.cpSync(srcPkg, pkgDest, { recursive: true });
+          // npm hoists, so the package's own dependencies are not inside it.
+          // Without this the copy lands unable to resolve its imports —
+          // `Cannot find package 'ajv' imported from apra-fleet-workflow`.
+          copyMissingDeps(pkgDest, path.dirname(src.scope), destDir);
         }
       }
     }

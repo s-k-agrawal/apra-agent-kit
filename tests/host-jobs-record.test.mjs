@@ -103,3 +103,19 @@ test('assertJobsBackend rejects incomplete objects', () => {
   const ok = { start() {}, stop() {}, submit() {}, get() {}, cancel() {}, subscribe() {}, events() {}, stats() {} };
   assert.doesNotThrow(() => iface.assertJobsBackend(ok));
 });
+
+test('a fresh record declares the pause pointer and no snapshot', () => {
+  // The snapshot retired into host/checkpoint/. Leaving a dead `snapshot: null`
+  // on the record is not harmless: planResume once read identity off
+  // `record.snapshot`, which became permanently undefined, and the
+  // authorization check passed for everyone as a result. A field nothing
+  // writes should not be there to be read.
+  const r = rec.createRecord({ jobId: 'job-1', goal: 'g' });
+  assert.ok(!('snapshot' in r), 'no snapshot field on the record');
+
+  // `pendingBatchId` is the pointer park() writes. It was set ad hoc without
+  // ever being declared, so a fresh record and a parked one had different
+  // shapes.
+  assert.equal(r.pendingBatchId, null);
+  assert.equal(r.pendingInput, null);
+});

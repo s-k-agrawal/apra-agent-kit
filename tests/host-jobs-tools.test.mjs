@@ -9,11 +9,11 @@ const fakeJobs = {
   get: async (id) => (id === 'job-9' ? { id, status: 'completed', result: 42 } : null),
 };
 
-test('withJobTools appends the two tools only when jobs is present', () => {
+test('withJobTools appends the job tools only when jobs is present', () => {
   const base = [{ name: 'weather', tags: [] }];
   assert.equal(withJobTools(base, null).length, 1);
   const out = withJobTools(base, fakeJobs);
-  assert.deepEqual(out.map(t => t.name), ['weather', 'submit-task', 'job-status']);
+  assert.deepEqual(out.map(t => t.name), ['weather', 'submit-task', 'job-input', 'job-status']);
   for (const t of out.slice(1)) { assert.deepEqual(t.tags, ['jobs']); assert.equal(t.reversible, true); assert.ok(t.inputSchema); }
 });
 

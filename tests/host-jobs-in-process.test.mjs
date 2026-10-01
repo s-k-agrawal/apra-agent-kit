@@ -119,12 +119,17 @@ test('events and progress are recorded and published', async () => {
     await runner.progress(jobId, 1, 'calling weather');
     await runner.finish(jobId);
     const events = await jobs.events(jobId);
-    assert.deepEqual(events.map(e => e.type), ['queued', 'started', 'progress', 'settled']);
-    assert.deepEqual(events.map(e => e.seq), [1, 2, 3, 4]);
+    // `run_started` joins the stream: history and events are one append-only
+    // log here, the same way question_asked already was. Without it a rebuild
+    // cannot say what the run is or who it is for.
+    assert.deepEqual(events.map(e => e.type), ['queued', 'started', 'run_started', 'progress', 'settled']);
+    assert.deepEqual(events.map(e => e.seq), [1, 2, 3, 4, 5]);
     assert.equal((await jobs.get(jobId)).progress.iteration, 1);
+    // Only the four lifecycle events are *published* to subscribers and the
+    // webhook; a history entry is recorded, not broadcast.
     assert.equal(published.length, 4);
     assert.equal(published[3].ctx.callbackUrl, 'https://cb.test/h');
-    assert.deepEqual(await jobs.events(jobId, { afterSeq: 3 }).then(l => l.map(e => e.type)), ['settled']);
+    assert.deepEqual(await jobs.events(jobId, { afterSeq: 4 }).then(l => l.map(e => e.type)), ['settled']);
   } finally { await jobs.stop(); }
 });
 

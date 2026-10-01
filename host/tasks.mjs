@@ -4,6 +4,8 @@ import { createPooledFleetApi } from '../pool/pooled-fleet-api.mjs';
 import { classify, executeWorkflow } from './router.mjs';
 import { runTask } from './run-loop.mjs';
 import { createBudgets } from './budgets.mjs';
+import { checkpointKey } from './checkpoint/record.mjs';
+import { learnableAnswers } from './memory/learner.mjs';
 
 export const PROGRESS_TYPES = new Set(['plan', 'action', 'observation', 'review', 'step_review', 'step_started', 'step_failed', 'memory_recall', 'memory_learn']);
 
@@ -148,12 +150,18 @@ function extractTaskTags(task) {
 export async function executeHostedTask(task, {
   api, activeDispatcher, toolRegistry, runLoopConfig, routerConfig,
   budgetsConfig, guardrailsMod, jobs, signal, onProgress, memory, logger = console,
+  askUser, resumeFrom = null, checkpoint = null, maxSteps = Infinity,
 }) {
   const fullTask = { id: task.id ?? `t-${Date.now().toString(36)}`, ...task };
   // Accept a caller-supplied trace id so a run can be correlated with the
   // request that started it; generate one only when the caller has none.
   const traceId = task.traceId ?? `tr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  const budgetsMod = budgetsConfig ? createBudgets(mergeBudgetConfig(budgetsConfig, fullTask)) : null;
+  // A resumed run continues its budget rather than starting a fresh one.
+  // Without this a run could pause and resume indefinitely and never exhaust
+  // anything — the limits would be decorative.
+  const budgetsMod = budgetsConfig
+    ? createBudgets(mergeBudgetConfig(budgetsConfig, fullTask), resumeFrom?.budget ?? null)
+    : null;
   const useRouter = routerConfig?.enabled && !task.strategy;
   let lease;
   try {
@@ -234,8 +242,15 @@ export async function executeHostedTask(task, {
     const workspace = { workerId: lease.workerId, doer: lease.doer, reviewer: lease.reviewer };
     const pooledApi = createPooledFleetApi(api, lease);
 
-    let memories = [];
-    if (memory?.longTerm) {
+    // A resumed run reproduces the prompt the original had. Recalling again
+    // would reason from whatever memory holds *now* — decay, a newly learnt
+    // fact or an evicted turn is enough to make the resumed run disagree with
+    // the one the person actually answered.
+    const resumedFacts = Array.isArray(resumeFrom?.recalledFacts) ? resumeFrom.recalledFacts : null;
+    const resumedConversation = Array.isArray(resumeFrom?.conversation) ? resumeFrom.conversation : null;
+
+    let memories = resumedFacts ?? [];
+    if (memory?.longTerm && !resumedFacts) {
       try {
         const tags = extractTaskTags(task);
         logger.info?.(`memory recall tags=${JSON.stringify(tags)}`);
@@ -257,9 +272,9 @@ export async function executeHostedTask(task, {
       }
     }
 
-    let conversationHistory = [];
+    let conversationHistory = resumedConversation ?? [];
     const cc = memory?.conversationContext;
-    const ccMode = cc?.mode ?? null;
+    const ccMode = resumedConversation ? null : (cc?.mode ?? null);
 
     if (ccMode === 'store' && task.sessionId) {
       try {
@@ -317,54 +332,81 @@ export async function executeHostedTask(task, {
         memory,
         memories,
         conversation: conversationHistory,
+        askUser,
+        resumeFrom,
+        // The checkpoint, plus what a resume needs to reproduce this run's
+        // prompt: who the agent is, and the facts and conversation it was
+        // given. Recalling a different set on resume changes behaviour with
+        // no trace.
+        checkpoint,
+        maxSteps,
+        agentName: runLoopConfig.agentName,
+        agentDescription: runLoopConfig.agentDescription,
       });
     }
 
-    if (ccMode === 'store' && task.sessionId && cc) {
-      try {
-        const answerText = typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result ?? null);
-        const turn = await cc.recordTurn(task.sessionId, {
-          goal: task.goal,
-          answer: answerText,
-          status: result.status,
-        });
-        logger.info?.(`conversation turn recorded: ${turn?.id} for session ${task.sessionId}`);
-      } catch (err) {
-        logger.warn?.(`conversation turn record failed: ${err?.message ?? err}`);
-      }
-    }
-
-    if (memory?.learner) {
-      try {
-        const learned = await memory.learner.extract({
-          task: fullTask,
-          history: result.observations ?? result.history ?? [],
-          recalledFacts: memories,
-          fleetApi: pooledApi,
-        });
-        if (onProgress) {
-          try {
-            await onProgress({
-              kind: 'memory_learn',
-              newFacts: (learned.newFacts ?? []).map(r => {
-                const e = r.entry ?? r;
-                return { id: e.id, kind: e.kind, text: e.text, tags: e.tags };
-              }),
-              promotedIds: learned.promotedIds ?? [],
-            });
-          } catch { /* progress is best-effort */ }
+    // None of this applies to a run that has not finished. `paused` is waiting
+    // on a person; `suspended` is an Azure run handing control back between
+    // steps so the orchestrator can commit. For either, recording a
+    // conversation turn would log an answer nobody gave, learning would learn
+    // from half a run, and clearing the checkpoint would throw away exactly
+    // what the next advance needs — it would start over and re-run whatever
+    // irreversible work had already completed.
+    if (result.status !== 'paused' && result.status !== 'suspended') {
+      if (ccMode === 'store' && task.sessionId && cc) {
+        try {
+          const answerText = typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result ?? null);
+          const turn = await cc.recordTurn(task.sessionId, {
+            goal: task.goal,
+            answer: answerText,
+            status: result.status,
+          });
+          logger.info?.(`conversation turn recorded: ${turn?.id} for session ${task.sessionId}`);
+        } catch (err) {
+          logger.warn?.(`conversation turn record failed: ${err?.message ?? err}`);
         }
-      } catch (err) {
-        logger.warn?.(`memory learner failed: ${err?.message ?? err}`);
       }
-    }
-    if (memory?.runState) {
-      try {
-        await memory.runState.clear(fullTask.id ?? task.id ?? task.goal);
-      } catch (err) {
-        logger.warn?.(`memory run-state clear failed: ${err?.message ?? err}`);
+
+      // A person who cancelled did not state a preference, so a cancelled
+      // run learns nothing.
+      if (memory?.learner && result.status !== 'cancelled') {
+        try {
+          const learned = await memory.learner.extract({
+            task: fullTask,
+            history: result.observations ?? result.history ?? [],
+            recalledFacts: memories,
+            // Higher signal than a tool result: these are preferences the
+            // person stated outright. Guardrail questions and approvals never
+            // appear here — see learnableAnswers.
+            answers: learnableAnswers(
+              jobs && fullTask.id ? await jobs.events(fullTask.id).catch(() => []) : [],
+            ),
+            fleetApi: pooledApi,
+          });
+          if (onProgress) {
+            try {
+              await onProgress({
+                kind: 'memory_learn',
+                newFacts: (learned.newFacts ?? []).map(r => {
+                  const e = r.entry ?? r;
+                  return { id: e.id, kind: e.kind, text: e.text, tags: e.tags };
+                }),
+                promotedIds: learned.promotedIds ?? [],
+              });
+            } catch { /* progress is best-effort */ }
+          }
+        } catch (err) {
+          logger.warn?.(`memory learner failed: ${err?.message ?? err}`);
+        }
+      }
+      if (checkpoint && fullTask.id) {
+        try {
+          await checkpoint.clear(checkpointKey({ id: fullTask.id }));
+        } catch (err) {
+          logger.warn?.(`checkpoint clear failed: ${err?.message ?? err}`);
+        }
       }
     }
     return { taskId: fullTask.id, traceId, routedTo, ...result };

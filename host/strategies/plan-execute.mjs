@@ -1,5 +1,6 @@
 // host/strategies/plan-execute.mjs
 import { parseResponse } from '../response-parser.mjs';
+import { checkpointKey, stepIdempotencyKey } from '../checkpoint/record.mjs';
 import {
   buildSystemPrompt, buildPlanPrompt, buildReviewPrompt, buildStepReviewPrompt,
   buildResolveArgsPrompt, buildReasonPrompt, buildReplanPrompt, buildExecutePrompt,
@@ -36,11 +37,34 @@ export function createPlanExecuteStrategy({
   memory,
   memories,
   conversation,
+  askUser = undefined,
+  resumeFrom = null,
+  checkpoint = null,
+  // Azure only. The orchestrator must commit the checkpoint between steps, and
+  // `callEntity` is reachable only from the orchestrator generator — so the
+  // activity advances the run by this many steps and then suspends. Unset on
+  // the VM path, where a run executes end to end in one go.
+  maxSteps = Infinity,
 }) {
   const systemPrompt = buildSystemPrompt({ agentName, agentDescription, memories, conversation });
   const toolCatalog = formatTools(tools);
-  const observations = [];
-  const taskKey = task.id ?? task.goal;
+  // Seeded on a resume; the empty array it has always been otherwise.
+  const observations = resumeFrom?.observations ? [...resumeFrom.observations] : [];
+  // ...and if it was seeded, the checkpoint load below must not append the same
+  // observations again. `resumeContextFor` builds `resumeFrom` from the very
+  // row that load reads, so before this flag a resume counted every completed
+  // step twice, and the next save persisted the doubled list.
+  const seededFromResume = Array.isArray(resumeFrom?.observations);
+  // One key, from one place. The retired run-state used `task.id ?? task.goal`,
+  // so two concurrent runs of the same goal shared a row and clobbered each
+  // other. A task with no id cannot be checkpointed at all — see checkpointKey.
+  let taskKey = null;
+  try { taskKey = checkpointKey(task); } catch { taskKey = null; }
+
+  // Where a pause left off, updated as execution advances, so `progress()`
+  // reports the truth at whatever moment the run happens to unwind.
+  let progressPlan = resumeFrom?.plan ?? null;
+  let progressCursor = resumeFrom?.plan?.cursor ?? 0;
 
   function remember(observation) {
     observations.push(observation);
@@ -70,56 +94,73 @@ export function createPlanExecuteStrategy({
       return { ok: false, error: `Tool "${name}" not found in registry.` };
     }
     if (guardrails) {
-      return guardrails.execute(tool, { fleetApi, args, jobs, traceId, workspace });
+      return guardrails.execute(tool, { fleetApi, args, jobs, traceId, workspace, askUser });
     }
     const { executeTool } = await import('../tools/executor.mjs');
-    return executeTool(tool, { fleetApi, args, jobs, traceId, workspace });
+    return executeTool(tool, { fleetApi, args, jobs, traceId, workspace, askUser });
   }
 
   async function* iterate() {
+    let stepsThisPass = 0;
     let replanCount = 0;
     let currentPlan = null;
     let idempotencyKeys = new Set();
     let resumeStart = 0;
     let resumePending = false;
 
-    if (memory?.runState) {
-      try {
-        const checkpoint = await memory.runState.load(taskKey);
-        if (checkpoint) {
-          if (Number.isInteger(checkpoint.stepIndex)) resumeStart = checkpoint.stepIndex;
-          if (checkpoint.plan) {
-            currentPlan = checkpoint.plan;
-            resumePending = true;
-          }
-          for (const obs of checkpoint.observations ?? []) remember(obs);
-          idempotencyKeys = new Set(checkpoint.idempotencyKeys ?? []);
+    if (checkpoint && taskKey) {
+      const loaded = await checkpoint.load(taskKey);
+      if (loaded.ok) {
+        const cp = loaded.checkpoint;
+        // The cursor is `plan.cursor` now, not `stepIndex`. One name for one
+        // fact, shared with the pause path.
+        if (Number.isInteger(cp.plan?.cursor)) resumeStart = cp.plan.cursor;
+        if (cp.plan?.steps?.length) {
+          currentPlan = { ...cp.plan, steps: cp.plan.steps };
+          resumePending = true;
         }
-      } catch (err) {
-        console.warn(`[host] run-state load failed — continuing: ${err?.message ?? err}`);
+        // Only when nothing seeded them: same row, same observations.
+        if (!seededFromResume) for (const obs of cp.observations ?? []) remember(obs);
+        // Always taken from here. `resumeFrom` does not carry the keys, and
+        // without them a completed irreversible step runs a second time.
+        idempotencyKeys = new Set(cp.idempotencyKeys ?? []);
       }
     }
 
     async function saveCheckpoint(stepIndex, idempotencyKey) {
-      if (!memory?.runState) return;
+      if (!checkpoint || !taskKey) return;
       const nextKeys = new Set(idempotencyKeys);
       nextKeys.add(idempotencyKey);
+
+      let saved = false;
       try {
-        const saved = await memory.runState.save(taskKey, {
-          stepIndex,
-          plan: currentPlan,
-          observations,
-          budgetSnapshot: null,
-          idempotencyKeys: [...nextKeys],
-          strategy: 'plan-execute',
+        saved = await checkpoint.save(taskKey, {
+        jobId: task?.id ?? null,
+        traceId,
+        task,
+        // Resuming under a renamed agent or a different strategy changes
+        // behaviour with no trace, so all three are recorded.
+        agentName,
+        agentDescription,
+        strategy: 'plan-execute',
+        plan: { steps: currentPlan?.steps ?? [], cursor: stepIndex },
+        observations,
+        idempotencyKeys: [...nextKeys],
+          conversation: conversation ?? [],
+          recalledFacts: memories ?? [],
         });
-        // false means the write failed and the previous snapshot must stay.
-        // A missing return value is treated as success for test doubles.
-        if (saved === false) return;
       } catch (err) {
-        console.warn(`[host] run-state save failed — continuing: ${err?.message ?? err}`);
+        // The shipped checkpoint returns false rather than throwing, but a
+        // different implementation might not — and losing a checkpoint must
+        // never take down a run that is otherwise fine.
+        console.warn(`[host] checkpoint save threw — continuing: ${err?.message ?? err}`);
         return;
       }
+
+      // A false means the write failed and the previous checkpoint must stay;
+      // advancing the in-memory key set would let a step be skipped after a
+      // crash that the store never learnt about.
+      if (!saved) return;
       idempotencyKeys = nextKeys;
     }
 
@@ -198,8 +239,22 @@ export function createPlanExecuteStrategy({
       return yield* reviewPlan(revisedPlan);
     }
 
-    // Phase 1: Plan (skipped when a checkpoint already holds a plan)
-    if (!currentPlan) {
+    // Phase 1: Plan — skipped when a run-state checkpoint already holds a
+    // plan, and skipped entirely when resuming from a pause. The plan was made
+    // and reviewed before the run paused; re-planning would discard completed
+    // work and cost another round of prompts for an answer we already have.
+    //
+    // A paused resume and a checkpoint resume are the same shape, so this
+    // feeds the checkpoint's own resumeStart/resumePending rather than running
+    // a second mechanism beside it.
+    if (resumeFrom?.plan?.steps?.length) {
+      currentPlan = { ...resumeFrom.plan, steps: resumeFrom.plan.steps };
+      resumeStart = resumeFrom.plan.cursor ?? 0;
+      resumePending = true;
+      progressPlan = currentPlan;
+      progressCursor = resumeStart;
+      yield { type: 'plan', plan: currentPlan, _replan: false, _resumed: true };
+    } else if (!currentPlan) {
       const planPrompt = buildPlanPrompt({ task, tools: toolCatalog, systemPrompt });
       const planText = await callPrompt('doer', planPrompt);
       yield { type: 'prompt_usage', text: planText };
@@ -225,15 +280,17 @@ export function createPlanExecuteStrategy({
       resumePending = false;
       let restartExecution = false;
 
+      // Only the first pass resumes mid-plan — `start` is zero thereafter. A
+      // replan produces new steps, and new steps are new work: starting one of
+      // those part-way through would skip something that has never run.
+      progressPlan = currentPlan;
+
       for (let i = start; i < steps.length; i++) {
         const step = steps[i];
-        const idempotencyKey = `${step.tool ?? step.type}-${JSON.stringify(step.args ?? {})}-${i}`;
-        if (memory?.runState) {
-          try {
-            if (await memory.runState.hasIdempotencyKey(taskKey, idempotencyKey)) continue;
-          } catch (err) {
-            console.warn(`[host] run-state idempotency check failed — continuing: ${err?.message ?? err}`);
-          }
+        progressCursor = i;
+        const idempotencyKey = stepIdempotencyKey(step, i);
+        if (checkpoint && taskKey && await checkpoint.hasIdempotencyKey(taskKey, idempotencyKey)) {
+          continue;   // already done before a crash; do not run it twice
         }
 
         if (step.type === 'tool') {
@@ -367,11 +424,22 @@ export function createPlanExecuteStrategy({
         }
 
         await saveCheckpoint(i, idempotencyKey);
+
+        stepsThisPass += 1;
+        if (stepsThisPass >= maxSteps) {
+          // Not done, not failed: the run has more to do and is handing control
+          // back so the caller can commit. `cursor` is the next step to run —
+          // without it a suspend is indistinguishable from a crash.
+          progressCursor = i + 1;
+          yield { type: 'suspended', cursor: i + 1, plan: currentPlan };
+          return;
+        }
       }
 
       if (restartExecution) {
         continue executeLoop;
       }
+      progressCursor = steps.length;
       break executeLoop;
     }
 
@@ -394,5 +462,13 @@ export function createPlanExecuteStrategy({
   return {
     iterate,
     history: () => [...observations],
+    // What a pause needs to write down: the observations so far, and which
+    // step the plan had reached. The cursor points at the step that was being
+    // attempted, so a resume retries it rather than skipping it — the pause
+    // happened *before* it completed.
+    progress: () => ({
+      observations: [...observations],
+      plan: progressPlan ? { steps: progressPlan.steps, cursor: progressCursor } : null,
+    }),
   };
 }

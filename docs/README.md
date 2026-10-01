@@ -16,7 +16,7 @@
 | [development.md](development.md) | You are setting up, running tests, adding a workflow, or debugging a failure. |
 | [mcp-interface.md](mcp-interface.md) | You are setting up or extending the MCP server — tool catalog, registry contract, timeouts, auth, and hosting. |
 | [run-loop.md](run-loop.md) | You want the detailed reference for the autonomous run loop: strategies, budgets, guardrails, prompt templates, and the `/task` API. |
-| [memory.md](memory.md) | You want the memory system: conversation context, long-term facts with FSRS-6 decay, run-state recovery, memory tools, store adapters, and the REST API. |
+| [memory.md](memory.md) | You want the memory system: conversation context, long-term facts with FSRS-6 decay, checkpoint recovery, memory tools, store adapters, and the REST API. |
 | [chat-ui.md](chat-ui.md) | You want the built-in chat page: enabling it, what the card shows, the console event log, and its limits. |
 | [jobs.md](jobs.md) | Async jobs API: submit, poll, SSE, webhooks, cancellation, and MCP job tools. |
 | [deploy-azure-functions.md](deploy-azure-functions.md) | Deploy the agent on Azure Functions Premium with the Durable jobs backend. |

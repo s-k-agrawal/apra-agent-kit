@@ -435,6 +435,196 @@
     return frag;
   }
 
+  // --- Question form ---
+  //
+  // The run is parked on a question. Everything here is built from the batch
+  // the server sent: five kinds of field, one submit, and per-field errors on
+  // a rejection. A partial answer is never sent — the server validates the set
+  // atomically and would reject it anyway.
+
+  function fieldName(q, i) {
+    return 'hi-' + i + '-' + q.fieldId;
+  }
+
+  function renderApproval(q, name) {
+    var wrap = h('div', 'hi-choices');
+    var vals = [{ value: 'approve', label: 'Yes, go ahead' }, { value: 'deny', label: 'No' }];
+    for (var i = 0; i < vals.length; i++) {
+      var lab = h('label', 'hi-choice');
+      var input = document.createElement('input');
+      input.type = 'radio';
+      input.name = name;
+      input.value = vals[i].value;
+      if (q.default === vals[i].value) input.checked = true;
+      lab.append(input, h('span', null, vals[i].label));
+      wrap.append(lab);
+    }
+    return wrap;
+  }
+
+  function renderOptions(q, name, type) {
+    var wrap = h('div', 'hi-choices');
+    var opts = q.options || [];
+    for (var i = 0; i < opts.length; i++) {
+      var lab = h('label', 'hi-choice');
+      var input = document.createElement('input');
+      input.type = type;
+      input.name = name;
+      input.value = opts[i].value;
+      if (q.default === opts[i].value) input.checked = true;
+      // The label is the only thing shown. `value` may be an opaque id; the
+      // label may not be, and the server guarantees that.
+      lab.append(input, h('span', null, opts[i].label));
+      wrap.append(lab);
+    }
+    return wrap;
+  }
+
+  function renderTextField(q, name, placeholder) {
+    var input = document.createElement('textarea');
+    input.name = name;
+    input.rows = 2;
+    input.className = 'hi-text';
+    input.placeholder = placeholder || 'Your answer';
+    if (typeof q.default === 'string') input.value = q.default;
+    return input;
+  }
+
+  function renderQuestion(q, i, error) {
+    var name = fieldName(q, i);
+    var block = h('div', 'hi-q');
+    block.append(h('div', 'hi-prompt', q.prompt));
+
+    if (q.kind === 'approval') block.append(renderApproval(q, name));
+    else if (q.kind === 'pick_one') block.append(renderOptions(q, name, 'radio'));
+    else if (q.kind === 'pick_many') block.append(renderOptions(q, name, 'checkbox'));
+    else if (q.kind === 'text') block.append(renderTextField(q, name));
+    else if (q.kind === 'pick_one_or_text') {
+      block.append(renderOptions(q, name, 'radio'));
+      if (q.allowOther) {
+        var lab = h('label', 'hi-choice');
+        var radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = name;
+        radio.value = '__other__';
+        lab.append(radio, h('span', null, q.otherPrompt || 'Something else'));
+        block.append(lab);
+        var other = renderTextField(q, name + '-other', q.otherPrompt || 'Tell me instead');
+        other.className = 'hi-text hi-other';
+        block.append(other);
+      }
+    }
+
+    if (error) block.append(h('div', 'hi-field-error', error));
+    return block;
+  }
+
+  // Read one field's answer back out of the DOM, in the shape the route wants.
+  function readAnswer(form, q, i) {
+    var name = fieldName(q, i);
+
+    if (q.kind === 'pick_many') {
+      var boxes = form.querySelectorAll('input[name="' + name + '"]:checked');
+      var vals = [];
+      for (var b = 0; b < boxes.length; b++) vals.push(boxes[b].value);
+      // An empty array is a real answer meaning "none of these", so it is
+      // always sent rather than treated as an unanswered field.
+      return vals;
+    }
+
+    if (q.kind === 'text') {
+      var ta = form.querySelector('[name="' + name + '"]');
+      var text = ta ? ta.value.trim() : '';
+      return text === '' ? undefined : text;
+    }
+
+    var picked = form.querySelector('input[name="' + name + '"]:checked');
+    if (!picked) return undefined;
+
+    if (q.kind === 'pick_one_or_text' && picked.value === '__other__') {
+      var otherEl = form.querySelector('[name="' + name + '-other"]');
+      var other = otherEl ? otherEl.value.trim() : '';
+      return other === '' ? undefined : { other: other };
+    }
+    return picked.value;
+  }
+
+  function renderInputForm(turn) {
+    var pending = turn.pendingInput;
+    var wrap = h('div', 'hi-card');
+
+    wrap.append(h('div', 'hi-head', pending.askedBy === 'guardrail' ? 'Needs your approval' : 'A question for you'));
+
+    var form = document.createElement('form');
+    form.className = 'hi-form';
+
+    var fieldErrors = (turn.inputError && turn.inputError.fields) || {};
+    for (var i = 0; i < pending.questions.length; i++) {
+      var q = pending.questions[i];
+      form.append(renderQuestion(q, i, fieldErrors[q.fieldId]));
+    }
+
+    if (turn.inputError && turn.inputError.message) {
+      form.append(h('div', 'hi-error', turn.inputError.message));
+    }
+
+    var actions = h('div', 'hi-actions');
+    var submit = document.createElement('button');
+    submit.type = 'submit';
+    submit.className = 'hi-submit';
+    submit.textContent = turn.submittingInput ? 'Sending...' : 'Send answer';
+    submit.disabled = !!turn.submittingInput;
+    actions.append(submit);
+    form.append(actions);
+
+    form.addEventListener('submit', function(e) {
+      e.preventDefault();
+      if (turn.submittingInput) return;
+      var answers = {};
+      for (var k = 0; k < pending.questions.length; k++) {
+        var qq = pending.questions[k];
+        var v = readAnswer(form, qq, k);
+        if (v !== undefined) answers[qq.fieldId] = v;
+      }
+      doAnswer(pending.batchId, answers);
+    });
+
+    wrap.append(form);
+    return wrap;
+  }
+
+  function doAnswer(batchId, answers) {
+    if (!current || !current.turn.jobId) return;
+    var jobId = current.turn.jobId;
+    apply(function(turn) { return inputSubmitting(turn); });
+
+    fetch(apiBase + '/jobs/' + jobId + '/input', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ batchId: batchId, answers: answers }),
+    })
+      .then(function(res) {
+        return res.json().catch(function() { return null; }).then(function(body) { return { res: res, body: body }; });
+      })
+      .then(function(r) {
+        console.log('answer', r.res.status, r.body);
+        if (r.res.status === 200) return;   // input_resolved will arrive over SSE
+        var body = r.body || {};
+        // 410 and 409 are not the user's fault and cannot be fixed by editing
+        // the form, so they read as statements rather than validation errors.
+        var message = body.error === 'batch_expired' ? 'That question expired before it was answered.'
+          : body.error === 'already_answered' ? 'That question has already been answered.'
+          : body.error === 'not_waiting' ? 'This run is no longer waiting for an answer.'
+          : body.message || 'That answer was not accepted.';
+        apply(function(turn) { return inputRejected(turn, { message: message, fields: body.fields || null }); });
+      })
+      .catch(function(err) {
+        console.error('answer failed', err);
+        apply(function(turn) { return inputRejected(turn, { message: err.message }); });
+      });
+  }
+
+
   // --- Card rendering ---
 
   // --- Memory panels ---
@@ -556,6 +746,12 @@
     var learnPanel = renderMemoryLearn(turn.memoryLearn, card);
     if (learnPanel) body.append(learnPanel);
 
+    // A question the run is waiting on. Rendered above the answer slot because
+    // it is the only thing the person can act on right now.
+    if (isWaitingForInput(turn)) {
+      body.append(renderInputForm(turn));
+    }
+
     // Answer
     if (turn.status === 'completed' && turn.answer != null) {
       body.append(renderAnswer(turn.answer));
@@ -591,7 +787,7 @@
   function subscribe(url) {
     var source = new EventSource(url);
     current.source = source;
-    var types = ['queued', 'started', 'progress', 'settled'];
+    var types = ['queued', 'started', 'progress', 'settled', 'input_required', 'input_resolved'];
     for (var t = 0; t < types.length; t++) {
       (function(type) {
         source.addEventListener(type, function(msg) {

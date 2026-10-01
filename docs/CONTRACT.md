@@ -80,6 +80,94 @@ Anything other than the exact string `'approve'` denies.
 
 ---
 
+## 4a. `approvalCallback` outranks `askUser`
+
+When `modules.humanInput` is on, a guardrail that resolves to `approve` has two ways to ask:
+
+```
+policy resolves to 'approve'
+  1. approvalCallback configured?  → call it            (unchanged behaviour)
+  2. askUser available?            → raise a question and park the run
+  3. neither                       → deny, reason 'approval_denied'
+```
+
+The order is the contract. An adopter who already has their own approval transport must see no
+change from human input existing — silently rerouting their approvals to a screen they do not run is
+worse than not offering the feature at all.
+
+**Must hold:** with an `approvalCallback` configured, `askUser` is never consulted. With neither,
+the result is exactly today's `approval_denied`.
+
+---
+
+## 4b. A pause is not a denial
+
+`askUser` either returns an answer or throws `PauseRequested`. That throw is how a run unwinds out of
+the strategy so its worker lease can be released.
+
+Every layer between a tool and the run loop turns throws into `{ ok: false }` values — that is
+contract 2, and it is right for failures. The three human-input signals (`PauseRequested`,
+`TooManyInterruptions`, `InvalidQuestion`) carry `isHumanInputSignal: true` and must be re-thrown
+instead. `host/tools/executor.mjs` does this; anything else that wraps tool execution must too.
+
+Degrading a pause into a denial runs the opposite of what nobody agreed to. Degrading an unaskable
+question into a tool error makes the model propose the same call again, and the run loops until the
+process dies.
+
+**Must hold:** a throw carrying `isHumanInputSignal` propagates to the run loop untouched.
+
+---
+
+## 4c. Questions are in plain language
+
+`prompt` and `options[].label` contain no identifiers, no tool names, no parameter names.
+
+```
+good:  "Which Paris did you mean — France, or Texas?"
+bad:   "geocode returned 2 candidates; select feature_id (2988507|4717560)?"
+```
+
+Two reasons, and both are load-bearing: a question nobody understands trains people to approve
+reflexively, and internal structure on a screen is an information-disclosure surface. `options[].value`
+may be an opaque identifier; `options[].label` may not.
+
+A tool says how to describe itself with `approvalPrompt` (a string, or a function of the arguments).
+With neither that nor a `description`, the fallback is deliberately vague rather than leaking the
+tool's name.
+
+**Must hold:** the generated approval prompt never contains the tool name.
+
+---
+
+## 4d. Credentials are never persisted
+
+A run's checkpoint records `identity` — who the work is for — and never the bearer that proves
+it. These records live for days. A resumed run re-acquires authority the same way a fresh run does.
+
+`identity` is allow-listed (`personId`, `tenantId`) rather than filtered, because a filter only
+removes the credential shapes somebody thought of. Everything else written to a checkpoint is
+passed through a scrub that drops credential-shaped keys at every depth.
+
+**Must hold:** no token, cookie, key or password survives a checkpoint save.
+
+---
+
+## 4e. The checkpoint is a cache, and history is the truth
+
+One checkpoint serves both crash recovery and a pause; there is no separate snapshot record.
+
+A resume reads the checkpoint when it can and rebuilds from history when it cannot — absent,
+unreadable, or written at an incompatible `version`. Nothing may exist only in the checkpoint.
+
+An incompatible version is **refused, not coerced**. A different build may have meant something
+different by the same field name, and resuming on a misread plan cursor re-executes work that
+already happened.
+
+**Must hold:** deleting a checkpoint and resuming from history produces the same state. History is
+never ring-buffered — `ringEvents()` exists for the size-capped Azure `customStatus` view only.
+
+---
+
 ## 5. Kit identity is recorded
 
 `package.json` carries a `version`. `host/kit-info.mjs` reads it and the `/health` route reports it.
@@ -126,6 +214,8 @@ handles them:
 - **Tenant isolation** — the kit has no tenant concept.
 - **Rate limiting** — budgets cap a single run, not a consumer.
 - **Secret distribution** — each clone handles its own.
-- **Authentication of the approver** — the callback returns a decision, not an identity.
+- **Authentication of the approver** — `approvalCallback` returns a decision, not an identity. The
+  `POST /jobs/:id/input` route does attribute an answer to the authenticated caller, but who that
+  caller is remains your authentication layer's problem.
 
 See `docs/kit-adoption-gaps.md` for the full list.

@@ -43,7 +43,7 @@ test('memory submodules without runLoop warn about missing run history', async (
     longTerm: { enabled: false, autoLearn: true },
   } } };`);
   const { warnings } = await loadWithWarnings(dir);
-  assert.ok(warnings.some(w => w.includes('memory.runState enabled but runLoop disabled')));
+  assert.ok(warnings.some(w => w.includes('memory.checkpoint enabled but runLoop disabled')));
   assert.ok(warnings.some(w => w.includes('memory.longTerm.autoLearn enabled but runLoop disabled')));
   assert.ok(warnings.some(w => w.includes('memory.longTerm.autoLearn enabled but longTerm disabled')));
   assert.ok(!warnings.some(w => /not implemented/i.test(w)));
@@ -60,7 +60,7 @@ test('memory submodules with runLoop and longTerm enabled do not warn', async ()
     },
   } };`);
   const { warnings } = await loadWithWarnings(dir);
-  assert.ok(!warnings.some(w => w.includes('memory.runState enabled but runLoop disabled')));
+  assert.ok(!warnings.some(w => w.includes('memory.checkpoint enabled but runLoop disabled')));
   assert.ok(!warnings.some(w => w.includes('memory.longTerm.autoLearn enabled but runLoop disabled')));
   assert.ok(!warnings.some(w => w.includes('memory.longTerm.autoLearn enabled but longTerm disabled')));
   assert.ok(!warnings.some(w => /memory/i.test(w) && /not implemented/i.test(w)));

@@ -93,22 +93,27 @@ When completing a travel planning task, your done result MUST include:
         },
       ],
     },
+    // All state lives in the Durable task hub, as entities. A Functions host has
+    // ephemeral, per-instance local disk, so sqlite here meant a checkpoint that
+    // did not survive between activity invocations. The task hub is already
+    // provisioned for Durable, so this costs an adopter nothing — no Cosmos
+    // account, no SQL server.
+    //
+    // `cosmos` and `mssql` remain selectable for anyone who wants them.
     memory: {
       conversationContext: {
         enabled: true,
         mode: 'store',
-        store: 'sqlite',
-        dbPath: './memory/conversation.db',
+        store: 'entity',
         maxRecentTurns: 6,
         maxTotalTurns: 20,
         compactionStrategy: 'summarise',
         answerMaxChars: 500,
       },
-      runState: { enabled: true, store: 'sqlite', dbPath: './memory/run-state.db' },
+      checkpoint: { enabled: true, store: 'entity' },
       longTerm: {
         enabled: true,
-        store: 'sqlite',
-        dbPath: './memory/memory.db',
+        store: 'entity',
         autoLearn: true,
         decay: { mode: 'auto', intervalMs: 120_000 },
         dedup: { enabled: true },

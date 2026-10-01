@@ -4,12 +4,32 @@
 // polling cursors in memory. It reads the customStatus contract that
 // comm/azure-functions/orchestrator.mjs writes.
 import { JobQueueFullError, JobsClosedError, validateCallbackUrl } from './interface.mjs';
-import { TERMINAL_STATUSES, createRecord, queuedEvent } from './record.mjs';
+import {
+  TERMINAL_STATUSES, createRecord, queuedEvent,
+  answerReceivedEntry, questionExpiredEntry, inputResolvedEvent,
+} from './record.mjs';
+import { planResume } from '../human-input/resume.mjs';
+import { answeredBatchesFromHistory } from '../human-input/ask.mjs';
+import { isStale, isExpired } from '../human-input/batch.mjs';
+import { checkpointKey, validateCheckpoint } from '../checkpoint/record.mjs';
 
 export const ORCHESTRATOR_NAME = 'runTaskOrchestrator';
 export const ACTIVITY_NAME = 'runTaskActivity';
 const ACTIVE = ['Pending', 'Running'];
 const STATUS_OPTS = { showHistory: false, showInput: true };
+
+/**
+ * Every history entry this instance knows about.
+ *
+ * Earlier segments are carried forward in the orchestration input by
+ * provideInput; the current segment's own entries, when it settles, come back
+ * in the output. Neither alone is the whole run.
+ */
+function carriedHistory(instance) {
+  const carried = instance.input?.resume?.history ?? [];
+  const fromOutput = instance.output?.history ?? [];
+  return [...carried, ...fromOutput];
+}
 
 export function mapDurableStatus(instance) {
   if (!instance) return null;
@@ -20,7 +40,9 @@ export function mapDurableStatus(instance) {
   let status;
   if (rt === 'Pending') status = 'queued';
   else if (rt === 'Running' || rt === 'Suspended' || rt === 'ContinuedAsNew') status = cs.status && cs.status !== 'queued' ? cs.status : 'processing';
-  else if (rt === 'Completed') status = instance.output?.status ?? cs.status ?? 'completed';
+  // A paused run is a *Completed* orchestration - that is the whole design -
+  // so the output has to be consulted before the runtime status is believed.
+  else if (rt === 'Completed') status = instance.output?.status === 'paused' ? 'waiting_input' : (instance.output?.status ?? cs.status ?? 'completed');
   else if (rt === 'Terminated' || rt === 'Canceled') status = 'cancelled';
   else status = 'failed';
 
@@ -29,10 +51,26 @@ export function mapDurableStatus(instance) {
   if (cs.finishedAt) out.finishedAt = cs.finishedAt;
   if (cs.progress) out.progress = cs.progress;
   if (rt === 'Completed' && instance.output && typeof instance.output === 'object') {
-    out.result = instance.output.result ?? null;
-    out.error = instance.output.error ?? null;
-    out.history = instance.output.history ?? [];
-    out.budget = instance.output.budget ?? null;
+    if (instance.output.status === 'paused') {
+      // The output *is* the store here. Nothing else holds this run's state.
+      out.pendingInput = instance.output.batch ?? null;
+      out.pendingBatchId = instance.output.batchId ?? null;
+      // A pointer to the memory store, not the state itself.
+      out.checkpointKey = instance.output.checkpointKey ?? null;
+      // The accumulated history travels in the orchestration *input*, written
+      // by provideInput when it started this one. The output stopped carrying
+      // it when it became a pointer, so reading it there always gave [] — the
+      // audit trail vanished at the first pause and the learner saw nothing.
+      out.history = carriedHistory(instance);
+      out.result = null;
+      out.error = null;
+    } else {
+      out.result = instance.output.result ?? null;
+      out.error = instance.output.error ?? null;
+      // Same for a settled run: segments before the last pause are in the input.
+      out.history = carriedHistory(instance);
+      out.budget = instance.output.budget ?? null;
+    }
   }
   if (rt === 'Failed') {
     const message = typeof instance.output === 'string' ? instance.output : JSON.stringify(instance.output ?? 'orchestration failed');
@@ -54,7 +92,36 @@ function clientFactory({ client, getClient }) {
   throw new Error('createDurableJobs requires a Durable client');
 }
 
-export function createDurableJobs({ client, getClient, config, notifier = null, logger = console, allowHttpCallbacks = false, now = () => new Date() }) {
+/**
+ * The state a paused run resumes from.
+ *
+ * Tried in order: the checkpoint entity in the task hub, then an injected
+ * store, then nothing — which makes the caller rebuild from history.
+ *
+ * An unreadable entity is **not** a refused answer. A run parked by an older
+ * kit has no entity at all, and throwing here would strand every run that was
+ * already waiting when the host was upgraded.
+ */
+async function loadPausedState(client, taskKey, checkpoint, logger, jobId) {
+  if (typeof client?.readEntityState === 'function') {
+    try {
+      const df = await import('durable-functions');
+      const res = await client.readEntityState(new df.EntityId('checkpoint', taskKey));
+      if (res?.entityExists && res.entityState) {
+        const verdict = validateCheckpoint(res.entityState);
+        if (verdict.ok) return verdict;
+        logger.warn?.(`[durable] job ${jobId} checkpoint entity unusable (${verdict.reason}); rebuilding from history`);
+        return verdict;
+      }
+    } catch (err) {
+      logger.warn?.(`[durable] job ${jobId} could not read its checkpoint entity: ${err?.message ?? err}`);
+    }
+  }
+  if (checkpoint) return checkpoint.load(taskKey);
+  return { ok: false, reason: 'absent' };
+}
+
+export function createDurableJobs({ client, getClient, config, notifier = null, logger = console, allowHttpCallbacks = false, checkpoint = null, kitVersion = null, now = () => new Date() }) {
   const resolveClient = clientFactory({ client, getClient });
   const { maxQueueSize = 100, durable: { pollMs = 2000 } = {} } = config ?? {};
   let closed = false;
@@ -183,6 +250,122 @@ export function createDurableJobs({ client, getClient, config, notifier = null, 
           try { fn(e); } catch (err) { logger.warn(`[durable] emitEvent subscriber error: ${err?.message ?? err}`); }
         }
       }
+    },
+
+    /** Every run parked on a question. A paused run is a Completed instance. */
+    async listWaiting() {
+      const bound = requireClient();
+      const done = await bound.getStatusBy({ runtimeStatus: ['Completed'] });
+      return done
+        .filter(i => i.customStatus?.status === 'waiting_input' || i.output?.status === 'paused')
+        .map(mapDurableStatus);
+    },
+
+    async pendingInput(jobId) {
+      const inst = await requireClient().getStatus(jobId, STATUS_OPTS);
+      const batch = inst?.output?.batch ?? null;
+      if (!batch) return null;
+      return { ...batch, stale: isStale(batch, now()), expired: isExpired(batch, now()) };
+    },
+
+    // Staleness is a view here, not a stored flag: there is no record to write
+    // it on, and it is recomputed from the batch's own deadline anyway.
+    async markInputStale() {
+      return { ok: false, reason: 'not_applicable' };
+    },
+
+    /**
+     * Accept an answer and start a **new** orchestration to carry the run on.
+     *
+     * This is the crux of the Azure design, and it is why the replay bug
+     * cannot come back: *we do not resume an orchestration, we start another
+     * one.* No `waitForExternalEvent`, no `Task.any`, no growing replay
+     * history, nothing billed while a person thinks.
+     *
+     * The previous output is read first, because `startNew` on the same
+     * instance id replaces it - and it is the only copy of the run's state.
+     */
+    async provideInput(jobId, submission, { identity = null } = {}) {
+      if (closed) throw new JobsClosedError();
+      const bound = requireClient();
+
+      const inst = await bound.getStatus(jobId, STATUS_OPTS);
+      const record = mapDurableStatus(inst);
+      // Plus anything asked during the segment that just paused. A pause holds
+      // one unanswered batch, so this is bounded; the accumulated history
+      // stays in the input rather than growing the 16 KB output.
+      const history = [...(record?.history ?? []), ...(inst?.output?.asked ?? [])];
+
+      // Follow the pointer. The paused output carries a key and nothing else,
+      // so without this read the run resumes from an empty history and re-does
+      // every step it had already completed — including the irreversible ones.
+      const taskKey = record?.checkpointKey ?? checkpointKey({ id: jobId });
+      // The state lives in the task hub as an entity, so a default deployment
+      // needs neither Cosmos nor SQL. The injected store is the fallback for a
+      // host configured with one, and for tests that do not have a hub.
+      const loaded = await loadPausedState(bound, taskKey, checkpoint, logger, jobId);
+      if (checkpoint && !loaded.ok && loaded.reason !== 'absent') {
+        logger.warn(`[durable] job ${jobId} resumed from history (${loaded.reason}); its checkpoint was unusable`);
+      }
+
+      const plan = planResume(record, submission, {
+        loaded, taskKey, history, identity, kitVersion, now: now(),
+      });
+      if (!plan.ok) return plan;
+
+      const answerEntry = answerReceivedEntry(jobId, {
+        batchId: plan.batch.batchId, answers: plan.answers, answeredBy: plan.answeredBy,
+      }, now());
+
+      // Everything the next orchestration needs, carried in its input. Read
+      // before the startNew below overwrites the instance.
+      await bound.startNew(ORCHESTRATOR_NAME, {
+        instanceId: jobId,
+        input: {
+          task: inst?.input?.task ?? { id: jobId, ...(record?.task ?? {}) },
+          record: { ...record, status: 'queued', pendingInput: null },
+          callbackUrl: inst?.input?.callbackUrl ?? null,
+          metadata: inst?.input?.metadata ?? {},
+          queuedEvent: queuedEvent(jobId, 1, now()),
+          resume: {
+            history: [...history, answerEntry],
+            answered: [...answeredBatchesFromHistory(history), { batchId: plan.batch.batchId, answers: plan.answers }],
+            resumeFrom: plan.resumeFrom,
+          },
+        },
+      });
+
+      if (notifier) {
+        try { await notifier.publish(inputResolvedEvent(jobId, { batchId: plan.batch.batchId, resolution: 'answered' }, now()), { callbackUrl: inst?.input?.callbackUrl ?? null }); }
+        catch (err) { logger.warn(`[durable] notifier error: ${err?.message ?? err}`); }
+      }
+
+      return { ok: true, status: 'queued', stale: plan.stale, batchId: plan.batch.batchId };
+    },
+
+    /** Settle a run whose question nobody answered in time. */
+    async expireInput(jobId) {
+      const bound = requireClient();
+      const inst = await bound.getStatus(jobId, STATUS_OPTS);
+      const record = mapDurableStatus(inst);
+      if (record?.status !== 'waiting_input') return { ok: false, code: 'not_waiting' };
+
+      const batch = record.pendingInput;
+      if (!batch || !isExpired(batch, now())) return { ok: false, code: 'not_expired' };
+
+      // Terminating a Completed instance is a no-op, so the settle is recorded
+      // by starting a short orchestration that finishes immediately failed.
+      // Simpler and more honest: mark it terminated with a reason the status
+      // map already reads as cancelled, and keep the history in the output.
+      await bound.terminate(jobId, `input expired at ${batch.expiresAt}`);
+
+      if (notifier) {
+        try {
+          await notifier.publish(questionExpiredEntry(jobId, { batchId: batch.batchId }, now()), { callbackUrl: inst?.input?.callbackUrl ?? null });
+          await notifier.publish(inputResolvedEvent(jobId, { batchId: batch.batchId, resolution: 'timeout' }, now()), { callbackUrl: inst?.input?.callbackUrl ?? null });
+        } catch (err) { logger.warn(`[durable] notifier error: ${err?.message ?? err}`); }
+      }
+      return { ok: true, status: 'failed', batchId: batch.batchId };
     },
 
     async refreshStats() {

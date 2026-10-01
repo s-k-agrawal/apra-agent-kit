@@ -6,8 +6,8 @@ import { resolveDispatchConfig, resolveNotifyConfigWithEnv } from './jobs/config
 import { resolveSchedulerConfig } from './scheduler/config.mjs';
 
 const SUPPORTED_ADAPTERS = new Set(['express', 'raw-http', 'azure-functions']);
-const KNOWN_MODULES = new Set(['runLoop', 'memory', 'budgets', 'guardrails', 'evals', 'dispatch', 'notify', 'chat', 'router', 'scheduler']);
-const IMPLEMENTED_MODULES = new Set(['runLoop', 'budgets', 'guardrails', 'dispatch', 'notify', 'chat', 'router', 'memory', 'evals', 'scheduler']);
+const KNOWN_MODULES = new Set(['runLoop', 'memory', 'budgets', 'guardrails', 'evals', 'dispatch', 'notify', 'chat', 'router', 'scheduler', 'humanInput']);
+const IMPLEMENTED_MODULES = new Set(['runLoop', 'budgets', 'guardrails', 'dispatch', 'notify', 'chat', 'router', 'memory', 'evals', 'scheduler', 'humanInput']);
 
 export async function loadConfig(configDir, env = process.env) {
   const raw = await resolveConfig(configDir);
@@ -132,8 +132,8 @@ function validate(raw, env) {
     if (mem.conversationContext?.enabled && !modules.chat?.enabled) {
       console.warn('[host/config] memory.conversationContext enabled but chat disabled — no conversation to track');
     }
-    if (mem.runState?.enabled && !runLoopEnabled) {
-      console.warn('[host/config] memory.runState enabled but runLoop disabled — no step sequence to checkpoint');
+    if ((mem.checkpoint ?? mem.runState)?.enabled && !runLoopEnabled) {
+      console.warn('[host/config] memory.checkpoint enabled but runLoop disabled — no step sequence to checkpoint');
     }
     if (mem.longTerm?.autoLearn && !runLoopEnabled) {
       console.warn('[host/config] memory.longTerm.autoLearn enabled but runLoop disabled — needs a run to learn from');
@@ -190,6 +190,12 @@ function validate(raw, env) {
   if (notify.webhook.allowHttp) console.warn('[host/config] notify.webhook.allowHttp is on — plain-http callback URLs are accepted');
   modules.notify = notify;
 
+  const humanInput = resolveHumanInputConfig(modules.humanInput, { env });
+  modules.humanInput = humanInput;
+  // Refuses a configuration that cannot work, rather than warning and failing
+  // at the first question days later.
+  assertHumanInputDependencies(modules);
+
   const chat = resolveChatConfig(modules.chat, { env, name: raw.name });
   if (chat.enabled) {
     if (!modules.dispatch?.enabled) {
@@ -213,4 +219,114 @@ function validate(raw, env) {
     }),
     modules: Object.freeze(modules),
   });
+}
+
+// Defaults for durable human input. Off unless asked for: a kit that started
+// stopping runs to ask questions the moment it was cloned would be a surprise,
+// and every one of these numbers is a policy decision an adopter should make
+// deliberately.
+export const HUMAN_INPUT_DEFAULTS = Object.freeze({
+  enabled: false,
+  maxInterruptions: 10,          // counted in interruptions, not questions
+  staleAfterMs: 86_400_000,      // 24h - soft: warn on resume
+  expiresAfterMs: 604_800_000,   // 7d  - hard: treated as refused
+  sweepIntervalMs: 300_000,
+});
+
+export function resolveHumanInputConfig(raw, { env = {} } = {}) {
+  const enabledEnv = env.HUMAN_INPUT_ENABLED;
+  const enabled = enabledEnv === undefined
+    ? !!(raw?.enabled ?? HUMAN_INPUT_DEFAULTS.enabled)
+    : ['1', 'true', 'yes'].includes(String(enabledEnv).toLowerCase());
+
+  const out = { ...HUMAN_INPUT_DEFAULTS, ...(raw ?? {}), enabled };
+
+  // A limit of zero means every question is one too many, which is a run that
+  // can never ask anything - almost certainly a typo for "off".
+  if (!(Number.isInteger(out.maxInterruptions) && out.maxInterruptions > 0)) {
+    throw new Error(`humanInput.maxInterruptions must be a positive integer (got ${out.maxInterruptions})`);
+  }
+  for (const key of ['staleAfterMs', 'expiresAfterMs', 'sweepIntervalMs']) {
+    if (!(Number.isFinite(out[key]) && out[key] > 0)) {
+      throw new Error(`humanInput.${key} must be a positive number of milliseconds (got ${out[key]})`);
+    }
+  }
+  // A hard deadline inside the soft one means every question is expired before
+  // it is ever merely stale, and the warning never fires.
+  if (out.expiresAfterMs <= out.staleAfterMs) {
+    throw new Error(
+      `humanInput.expiresAfterMs (${out.expiresAfterMs}) must be greater than staleAfterMs (${out.staleAfterMs})`,
+    );
+  }
+
+  return Object.freeze(out);
+}
+
+/**
+ * A startup failure reason that is safe to put in an exception.
+ *
+ * A memory-store failure routinely carries a connection string, an endpoint,
+ * a SAS token or a file path. That belongs in the operator's log — where it is
+ * needed to diagnose — and never in an exception, which may be rendered to a
+ * screen, posted to an error tracker, or returned over HTTP.
+ *
+ * The error's *name* survives, because "which kind of failure" is useful and
+ * carries nothing. "Which host, which key, which path" is the part that does.
+ */
+export function describeStartupFailure(cause) {
+  const kind = cause?.name && cause.name !== 'Error' ? ` (${cause.name})` : '';
+  return `the memory store could not be opened${kind} — see the host log for the underlying cause`;
+}
+
+/**
+ * Human input has no graceful degrade: a paused run needs somewhere to park
+ * and somewhere to put a checkpoint.
+ *
+ * Called twice — once on the configuration, once after the memory module has
+ * actually opened. The second is the sharper case, because the configuration
+ * is correct and only the store is unreachable, so nobody is looking for a
+ * mistake.
+ *
+ * @param {object} modules
+ * @param {object} [opts]
+ * @param {boolean} [opts.memoryStarted] false when memory is configured but failed to open
+ */
+export function assertHumanInputDependencies(modules, { memoryStarted = true, cause = null } = {}) {
+  if (!modules?.humanInput?.enabled) return;
+
+  if (!modules.dispatch?.enabled) {
+    throw new Error(
+      'humanInput requires dispatch — there is nowhere to park a paused run on the synchronous ' +
+      '/task?wait=true path. Enable modules.dispatch or disable modules.humanInput.',
+    );
+  }
+
+  if (!modules.memory || modules.memory.enabled === false) {
+    throw new Error(
+      'humanInput requires memory — a paused run stores its checkpoint in the memory store. ' +
+      'Enable modules.memory or disable modules.humanInput.',
+    );
+  }
+
+  // `memory.enabled` is not the same as a checkpoint store existing. With no
+  // block the store resolves to null, the host starts happily, and every pause
+  // then dies on a raw null-deref that surfaces on the job record. Same rule as
+  // describeStartupFailure: name the setting, never quote its value.
+  const cp = modules.memory.checkpoint ?? modules.memory.runState ?? null;
+  if (!cp || cp.enabled === false) {
+    throw new Error(
+      'humanInput requires memory.checkpoint — a paused run stores its state there, and without ' +
+      'it the failure would surface at the first question rather than here. Configure ' +
+      'modules.memory.checkpoint (formerly memory.runState) or disable modules.humanInput.',
+    );
+  }
+
+  if (!memoryStarted) {
+    // Deliberately does not quote `cause`. See describeStartupFailure.
+    throw new Error(
+      `modules.humanInput is enabled but ${describeStartupFailure(cause)}. ` +
+      'A paused run would have nowhere to store its checkpoint, and the failure would surface at ' +
+      'the first question rather than here. Fix the memory store or disable modules.humanInput.',
+    );
+  }
 }

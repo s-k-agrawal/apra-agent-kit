@@ -1,10 +1,53 @@
 {
   "tools": {
-    "weather":         { "ok": true, "location": "Tokyo", "temp_c": "22", "humidity": "60", "description": "Clear", "wind_speed_kmph": "8", "uv_index": "5" },
-    "timezone":        { "ok": true, "timezone": "America/New_York", "datetime": "2026-09-17T06:00:00-04:00", "utc_offset": "-04:00", "abbreviation": "EDT" },
-    "country-info":    { "ok": true, "name": "Japan", "capital": "Tokyo", "currency_code": "JPY", "currency_name": "Japanese yen", "languages": ["Japanese"], "region": "Asia", "population": 125000000 },
-    "currency":        { "ok": true, "from": "USD", "to": "JPY", "rate": 146.2, "amount": 1, "converted": 146.2 },
-    "travel-advisory": { "ok": true, "country": "JP", "score": 1.8, "message": "Exercise normal precautions" }
+    "weather": {
+      "ok": true,
+      "location": "Tokyo",
+      "temp_c": "22",
+      "humidity": "60",
+      "description": "Clear",
+      "wind_speed_kmph": "8",
+      "uv_index": "5"
+    },
+    "timezone": {
+      "ok": true,
+      "timezone": "America/New_York",
+      "datetime": "2026-09-17T06:00:00-04:00",
+      "utc_offset": "-04:00",
+      "abbreviation": "EDT"
+    },
+    "country-info": {
+      "ok": true,
+      "name": "Japan",
+      "capital": "Tokyo",
+      "currency_code": "JPY",
+      "currency_name": "Japanese yen",
+      "languages": [
+        "Japanese"
+      ],
+      "region": "Asia",
+      "population": 125000000
+    },
+    "currency": {
+      "ok": true,
+      "from": "USD",
+      "to": "JPY",
+      "rate": 146.2,
+      "amount": 1,
+      "converted": 146.2
+    },
+    "travel-advisory": {
+      "ok": true,
+      "country": "JP",
+      "score": 1.8,
+      "message": "Exercise normal precautions"
+    },
+    "confirm-itinerary": {
+      "ok": true,
+      "saved": true,
+      "destination": "Kyoto",
+      "reference": "ITIN-KYO-1"
+    }
   },
   "goals": {
     "weather in Tokyo": [
@@ -30,8 +73,17 @@
       "```plan\n{\"steps\": [{\"type\": \"tool\", \"tool\": \"weather\", \"args\": {\"city\": \"Paris\"}, \"reason\": \"1\", \"review\": false}, {\"type\": \"tool\", \"tool\": \"weather\", \"args\": {\"city\": \"Berlin\"}, \"reason\": \"2\", \"review\": false}, {\"type\": \"tool\", \"tool\": \"weather\", \"args\": {\"city\": \"Rome\"}, \"reason\": \"3\", \"review\": false}, {\"type\": \"tool\", \"tool\": \"weather\", \"args\": {\"city\": \"Madrid\"}, \"reason\": \"4\", \"review\": false}, {\"type\": \"tool\", \"tool\": \"weather\", \"args\": {\"city\": \"Vienna\"}, \"reason\": \"5\", \"review\": false}, {\"type\": \"tool\", \"tool\": \"weather\", \"args\": {\"city\": \"Lisbon\"}, \"reason\": \"6\", \"review\": false}, {\"type\": \"tool\", \"tool\": \"weather\", \"args\": {\"city\": \"Oslo\"}, \"reason\": \"7\", \"review\": false}]}\n```",
       "```review\n{\"approved\": true}\n```",
       "```done\n{\"result\": \"partial\", \"summary\": \"partial\"}\n```"
+    ],
+    "save a trip to Kyoto": [
+      "```plan\n{\"steps\": [{\"type\": \"tool\", \"tool\": \"confirm-itinerary\", \"args\": {\"destination\": \"Kyoto\", \"summary\": \"Three days\", \"estimatedCost\": \"JPY 90,000\"}, \"reason\": \"save\", \"review\": false}]}\n```",
+      "```review\n{\"approved\": true}\n```",
+      "```done\n{\"result\": \"Saved your Kyoto itinerary.\", \"summary\": \"Saved\"}\n```"
     ]
   },
-  "default": ["```done\n{\"result\": \"unscripted goal\", \"summary\": \"none\"}\n```"],
-  "delays": { "every capital city in Europe": 1500 }
+  "default": [
+    "```done\n{\"result\": \"unscripted goal\", \"summary\": \"none\"}\n```"
+  ],
+  "delays": {
+    "every capital city in Europe": 1500
+  }
 }
