@@ -21,6 +21,10 @@ const started = await startHost({
 
 await registerDurableFunctions({
   pollMs: started.config.modules.dispatch?.durable?.pollMs ?? 2000,
+  // 1 means one attempt and no retry. Worth raising where a workflow route
+  // runs here: a workflow executes to completion inside a single activity with
+  // no checkpoint between its phases, so a worker recycle loses all of it.
+  activityRetry: started.config.modules.dispatch?.durable?.activityRetry ?? { maxAttempts: 1 },
   hostContextFactory: async () => ({
     api: started.fleetApi,
     activeDispatcher: started.dispatcher,

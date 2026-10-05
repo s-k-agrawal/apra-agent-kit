@@ -1,9 +1,9 @@
 // comm/azure-functions/index.mjs
 // Registers the orchestrator, the activities and the state entities.
-export async function registerDurableFunctions({ hostContextFactory, pollMs = 2000 }) {
+export async function registerDurableFunctions({ hostContextFactory, pollMs = 2000, activityRetry = { maxAttempts: 1 } }) {
   const df = await import('durable-functions');
   const { ORCHESTRATOR_NAME, ACTIVITY_NAME } = await import('../../host/jobs/durable.mjs');
-  const { runTaskOrchestrator, ADVANCE_NAME } = await import('./orchestrator.mjs');
+  const { buildOrchestrator, ADVANCE_NAME } = await import('./orchestrator.mjs');
   const { createRunTaskActivity, createAdvanceActivity, setHostContextFactory } = await import('./activity.mjs');
   const { registerCheckpointEntity } = await import('./entities/checkpoint-entity.mjs');
   const { registerConversationEntity } = await import('./entities/conversation-entity.mjs');
@@ -11,7 +11,8 @@ export async function registerDurableFunctions({ hostContextFactory, pollMs = 20
 
   setHostContextFactory(hostContextFactory);
   const clientInput = df.input.durableClient();
-  df.app.orchestration(ORCHESTRATOR_NAME, runTaskOrchestrator);
+  // The retry policy is baked in here so it is constant across replays.
+  df.app.orchestration(ORCHESTRATOR_NAME, buildOrchestrator({ activityRetry }));
 
   // The run loop's step. `runTaskActivity` stays registered: it is what a
   // whole-run dispatch still uses, and removing it would break any caller

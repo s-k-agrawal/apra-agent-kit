@@ -72,7 +72,14 @@ test('failed activity output is recorded correctly', () => {
   gen.next(advanced);
   const step = gen.next();
   assert.equal(step.done, true);
-  assert.deepEqual(ctx.statuses.at(-1).events.map(e => e.type), ['queued', 'started', 'settled']);
+  // `activity_failed` joins the stream: a failed step is now recorded with an
+  // audit record even when there is no retry, which is the point of the
+  // default of one attempt.
+  assert.deepEqual(ctx.statuses.at(-1).events.map(e => e.type), ['queued', 'started', 'activity_failed', 'settled']);
+  const failure = ctx.statuses.at(-1).events.find(e => e.type === 'activity_failed');
+  assert.equal(failure.attempt, 1);
+  assert.equal(failure.maxAttempts, 1);
+  assert.equal(failure.willRetry, false, 'one attempt means it is already giving up');
   assert.equal(ctx.statuses.at(-1).status, 'failed');
 });
 

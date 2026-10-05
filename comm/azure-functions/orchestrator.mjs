@@ -32,7 +32,11 @@ function truncateOutput(output) {
   return safe;
 }
 
-export function buildOrchestrator({ ringSize = 50 } = {}) {
+export function buildOrchestrator({ ringSize = 50, activityRetry = { maxAttempts: 1 } } = {}) {
+  // Baked in at registration, so it is constant across every replay of an
+  // orchestration — reading it per-replay would be non-deterministic.
+  const maxAttempts = Math.max(1, Number(activityRetry?.maxAttempts ?? 1));
+
   return function* runTaskOrchestrator(context) {
     const df = context.df;
     const input = df.getInput();
@@ -81,7 +85,37 @@ export function buildOrchestrator({ ringSize = 50 } = {}) {
     // replay bug becomes an unbounded bill.
     while (steps < MAX_STEPS) {
       steps += 1;
-      const advanced = yield df.callActivity(ADVANCE_NAME, { ...input, jobId, checkpointKey });
+
+      // Retry lives here rather than in `callActivityWithRetry`, which retries
+      // on a *thrown* exception — and the activity deliberately catches and
+      // returns a failed envelope so the orchestration can settle cleanly.
+      // Doing it here also means the orchestrator knows the attempt number and
+      // can hand it to the activity for the audit record.
+      //
+      // Deterministic: the loop count depends only on activity results, which
+      // replay identically.
+      let advanced = null;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        advanced = yield df.callActivity(ADVANCE_NAME, {
+          ...input, jobId, checkpointKey, attempt, maxAttempts,
+        });
+
+        if (advanced?.status !== 'failed') break;
+
+        const willRetry = attempt < maxAttempts;
+        // Recorded on every attempt, including the only one when maxAttempts
+        // is 1. A failure used to leave a single warn line and nothing on the
+        // record; now it is auditable.
+        push({
+          type: 'activity_failed', jobId, at: nowIso(),
+          attempt, maxAttempts, willRetry,
+          error: advanced?.error ?? null,
+          audit: advanced?.audit ?? null,
+        });
+        publish();
+
+        if (!willRetry) break;
+      }
 
       if (advanced.cleared) {
         // The run finished and dropped its checkpoint. Leaving the row behind

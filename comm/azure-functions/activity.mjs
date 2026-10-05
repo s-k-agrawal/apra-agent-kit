@@ -6,7 +6,7 @@ import { executeHostedTask, settleWhenAborted } from '../../host/tasks.mjs';
 import { settleFromRunResult, questionAskedEntry } from '../../host/jobs/record.mjs';
 import { createAskUser } from '../../host/human-input/ask.mjs';
 import { createCheckpoint } from '../../host/checkpoint/index.mjs';
-import { runAdvance } from './advance.mjs';
+import { runAdvance, buildFailureAudit } from './advance.mjs';
 import { checkpointKey } from '../../host/checkpoint/record.mjs';
 
 let factory = null;
@@ -189,7 +189,10 @@ export function createRunTaskActivity({ getClient, pollMs = 2000, getContext = g
  */
 export function createAdvanceActivity({ getClient, pollMs = 2000, getContext = getHostContext }) {
   return async function advanceTaskActivity(input, context) {
-    const { jobId, task, checkpointKey, callbackUrl, resume = null } = input;
+    const { jobId, task, checkpointKey, callbackUrl, resume = null, attempt = 1, maxAttempts = 1 } = input;
+    const startedAt = Date.now();
+    // What the step got through before it died. Bounded by the audit builder.
+    const trail = [];
     const client = getClient(context);
     const hostCtx = await getContext();
     const controller = new AbortController();
@@ -234,7 +237,10 @@ export function createAdvanceActivity({ getClient, pollMs = 2000, getContext = g
         state,
         hostCtx,
         signal: controller.signal,
-        onProgress: (progress) => emit({ type: 'progress', jobId, at: iso(), ...progress }),
+        onProgress: (progress) => {
+          if (progress?.message) trail.push(String(progress.message));
+          emit({ type: 'progress', jobId, at: iso(), ...progress });
+        },
         askUser,
       });
 
@@ -243,10 +249,21 @@ export function createAdvanceActivity({ getClient, pollMs = 2000, getContext = g
       }
       return { ...out, ...(askedHistory.length ? { asked: askedHistory } : {}) };
     } catch (err) {
-      context?.warn?.(`[advance] job ${jobId} failed: ${err?.message ?? err}`);
+      // A failed step used to leave one warn line and nothing on the record.
+      // The audit carries what somebody needs to chase it — which attempt of
+      // how many, how long it ran, what it got through, and where it died —
+      // scrubbed of anything credential-shaped and bounded so it cannot blow
+      // the orchestration payload.
+      const audit = buildFailureAudit({ jobId, attempt, maxAttempts, startedAt, err, logs: trail });
+      context?.warn?.(
+        `[advance] job ${jobId} failed on attempt ${attempt}/${maxAttempts} ` +
+        `after ${audit.durationMs}ms: ${audit.errorName}: ${audit.message}`,
+      );
+      emit({ type: 'activity_failed', jobId, at: iso(), ...audit });
       return {
         status: 'failed', done: true, delta: null, cleared: false, result: null,
-        error: { code: 'advance_failed', message: String(err?.message ?? err) },
+        error: { code: 'advance_failed', message: audit.message },
+        audit,
       };
     } finally {
       clearInterval(poll);

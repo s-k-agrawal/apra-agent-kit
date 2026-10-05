@@ -15,6 +15,53 @@
 import { executeHostedTask } from '../../host/tasks.mjs';
 import { createCheckpointRecord } from '../../host/checkpoint/record.mjs';
 
+// How much of a failure is worth keeping. An error message and a stack are
+// arbitrary text from arbitrary code, and both reach a log and a job record
+// that outlive the run — so they are scrubbed and bounded, not passed through.
+const MAX_MESSAGE_CHARS = 500;
+const MAX_STACK_CHARS = 1_200;
+const MAX_LOG_LINES = 10;
+const MAX_LOG_CHARS = 200;
+
+/**
+ * What somebody would need to chase a failed step.
+ *
+ * Built even when there is no retry — a single attempt that fails is still
+ * worth recording, and before this it produced one `warn` line and nothing on
+ * the record.
+ *
+ * @param {object}  o
+ * @param {string}  o.jobId
+ * @param {number}  o.attempt      1-based
+ * @param {number}  o.maxAttempts  so the record reads "2 of 3"
+ * @param {number}  o.startedAt    epoch ms, for how long it ran before dying
+ * @param {unknown} o.err
+ * @param {string[]} [o.logs]      whatever the step got through first
+ */
+export function buildFailureAudit({ jobId, attempt, maxAttempts, startedAt, err, logs }) {
+  const clip = (v, n) => {
+    const t = typeof v === 'string' ? v : String(v ?? '');
+    return t.length > n ? `${t.slice(0, n)}… [${t.length} chars]` : t;
+  };
+  // scrub() strips credential-shaped keys from objects; an error message is a
+  // bare string, so the token-shaped substrings are removed directly.
+  const clean = (t) => String(t ?? '')
+    .replace(/\b(?:sk|pk|ghp|gho|xox[baprs])-[A-Za-z0-9_-]{4,}/gi, '[redacted]')
+    .replace(/\b(token|secret|password|passwd|apikey|api[_-]?key|authorization|bearer|cookie|credential)\b\s*[:=]?\s*\S+/gi, '$1=[redacted]');
+
+  return {
+    jobId: jobId ?? null,
+    attempt: attempt ?? 1,
+    maxAttempts: maxAttempts ?? 1,
+    at: new Date().toISOString(),
+    durationMs: Number.isFinite(startedAt) ? Math.max(0, Date.now() - startedAt) : null,
+    errorName: (err && typeof err === 'object' && err.name) ? String(err.name) : 'Error',
+    message: clip(clean(err?.message ?? err), MAX_MESSAGE_CHARS),
+    stack: err?.stack ? clip(clean(err.stack), MAX_STACK_CHARS) : null,
+    logs: (Array.isArray(logs) ? logs : []).slice(-MAX_LOG_LINES).map(l => clip(clean(l), MAX_LOG_CHARS)),
+  };
+}
+
 /**
  * A checkpoint that lives for one activity invocation.
  *

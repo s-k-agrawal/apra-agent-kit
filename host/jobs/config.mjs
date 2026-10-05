@@ -13,7 +13,16 @@ export const DISPATCH_DEFAULTS = {
   // 'auto' resolves per backend: sqlite on a VM, the task hub on Functions.
   // An adopter who never touches storage config gets the right thing on both.
   store: { kind: 'auto', dbPath: path.join('workdir', 'jobs.db') },
-  durable: { taskHub: 'fleetjobs', pollMs: 2000, maxActivityMs: 3_600_000 },
+  durable: {
+    taskHub: 'fleetjobs', pollMs: 2000, maxActivityMs: 3_600_000,
+    // How many times the orchestrator will run a step activity before giving
+    // up. The default of 1 is one attempt and no retry — the behaviour that
+    // was there before this existed. It is worth setting above 1 where a
+    // *workflow* route runs on Functions: a workflow executes to completion
+    // inside a single activity with no checkpoint between its phases, so a
+    // worker recycle loses all of it.
+    activityRetry: { maxAttempts: 1 },
+  },
 };
 const BACKENDS = new Set(['in-process', 'durable']);
 const STORE_KINDS = new Set(STORE_KIND_NAMES);
@@ -30,7 +39,14 @@ export function resolveDispatchConfig(raw = {}, { env = process.env, budgetsConf
   const merged = {
     ...DISPATCH_DEFAULTS, ...raw,
     store: { ...DISPATCH_DEFAULTS.store, ...(raw.store ?? {}) },
-    durable: { ...DISPATCH_DEFAULTS.durable, ...(raw.durable ?? {}) },
+    durable: {
+      ...DISPATCH_DEFAULTS.durable,
+      ...(raw.durable ?? {}),
+      activityRetry: {
+        ...DISPATCH_DEFAULTS.durable.activityRetry,
+        ...(raw.durable?.activityRetry ?? {}),
+      },
+    },
   };
   merged.backend = env.JOBS_BACKEND || merged.backend;
   merged.maxQueueSize = intEnv(env, 'JOBS_MAX_QUEUE_SIZE', merged.maxQueueSize);
@@ -39,6 +55,16 @@ export function resolveDispatchConfig(raw = {}, { env = process.env, budgetsConf
   merged.store.dbPath = env.JOBS_DB_PATH || merged.store.dbPath;
   merged.durable.taskHub = env.DURABLE_TASK_HUB || merged.durable.taskHub;
   merged.durable.pollMs = intEnv(env, 'DURABLE_POLL_MS', merged.durable.pollMs);
+  merged.durable.activityRetry.maxAttempts = intEnv(
+    env, 'DURABLE_ACTIVITY_MAX_ATTEMPTS', merged.durable.activityRetry.maxAttempts,
+  );
+  // Zero would mean "never run the activity", which is not a retry policy.
+  if (!Number.isInteger(merged.durable.activityRetry.maxAttempts) || merged.durable.activityRetry.maxAttempts < 1) {
+    throw new Error(
+      `dispatch.durable.activityRetry.maxAttempts must be an integer >= 1 (1 means one attempt, no retry), ` +
+      `got ${merged.durable.activityRetry.maxAttempts}`,
+    );
+  }
   if (merged.leaseTimeoutMs === undefined) {
     merged.leaseTimeoutMs = typeof budgetsConfig?.timeoutMs === 'number' ? budgetsConfig.timeoutMs + 60_000 : 660_000;
   }
