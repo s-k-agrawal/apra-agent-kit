@@ -357,8 +357,9 @@ modules: {
       answerMaxChars: 500,                // truncate stored answers
     },
 
-    // Tier 2: Run state — crash recovery for interrupted tasks.
-    runState: {
+    // Tier 2: The checkpoint — crash recovery, and the record a paused run
+    // resumes from. `runState` is the former name and is still read.
+    checkpoint: {
       enabled: true,
       store: 'sqlite',
       dbPath: './memory/run-state.db',

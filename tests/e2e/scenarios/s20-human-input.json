@@ -1,0 +1,10 @@
+{ "id": "s20", "title": "a run parks on an approval, is answered over HTTP, and resumes",
+  "goal": "save a trip to Kyoto",
+  "strategy": "plan-execute", "constraints": { "maxIterations": 10 },
+  "expectedStatus": ["completed"], "expectedTools": ["confirm-itinerary"],
+  "humanInput": {
+    "expectAskedBy": "guardrail",
+    "expectKind": "approval",
+    "answer": { "proceed": "approve" },
+    "expectResultMatches": "Saved"
+  } }

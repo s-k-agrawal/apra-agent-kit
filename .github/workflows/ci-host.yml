@@ -21,6 +21,15 @@ jobs:
       - run: npm run test:host
       - run: npm run test:phase2
       - run: npm run test:phase4
+      - run: npm run test:human-input
+      # One checkpoint now backs both crash recovery and a pause, and it is
+      # stored through the memory module — so neither suite is optional any
+      # more. Both were in package.json but in no CI job until now.
+      - run: npm run test:checkpoint
+      - run: npm run test:memory
+      # The clone contract (docs/CONTRACT.md) says to run this in CI. It was
+      # not actually wired up until now.
+      - run: node --test tests/kit-conformance.test.mjs
 
   host-integration-tests:
     runs-on: ubuntu-latest
@@ -34,4 +43,4 @@ jobs:
       - name: Run host, run-loop and jobs suites in Docker
         run: |
           docker run --rm apra-agent-kit-ci \
-            sh -c "npm run test:host && npm run test:phase2 && npm run test:phase4"
+            sh -c "npm run test:host && npm run test:phase2 && npm run test:phase4 && npm run test:human-input && npm run test:checkpoint && npm run test:memory"

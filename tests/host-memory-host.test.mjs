@@ -107,7 +107,13 @@ test('startHost continues when memory fails to open', async () => {
   }
   try {
     assert.equal(started.memory, null, 'startHost must return null memory when memory fails to open');
-    assert.ok(warnings.some(w => /memory/i.test(w)));
+    // The message moved from console.warn to the host logger, so the outcome
+    // is asserted rather than the log line: the host is up, memory is off, and
+    // nothing memory-shaped is exposed. That is the degrade this test is for.
+    //
+    // It degrades only because humanInput is off here. With it on, a memory
+    // that fails to open is fatal — a paused run would have nowhere to put its
+    // checkpoint. See tests/host-checkpoint-config.test.mjs.
     assert.ok(!started.registry.some(tool => tool.name === 'remember'));
     const health = await httpCall(started.host.port(), 'GET', '/health');
     assert.equal(health.status, 200);

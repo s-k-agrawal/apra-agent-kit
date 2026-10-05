@@ -14,7 +14,12 @@ test('dispatch defaults and lease timeout derive from budgets', () => {
   assert.equal(c.drainMs, 30_000);
   assert.equal(c.store.kind, 'sqlite');
   assert.match(c.store.dbPath, /workdir[\\/]jobs\.db$/);
-  assert.deepEqual(c.durable, { taskHub: 'fleetjobs', pollMs: 2000, maxActivityMs: 3_600_000 });
+  // activityRetry defaults to a single attempt — one run of the activity and
+  // no retry, which is the behaviour that was there before it existed.
+  assert.deepEqual(c.durable, {
+    taskHub: 'fleetjobs', pollMs: 2000, maxActivityMs: 3_600_000,
+    activityRetry: { maxAttempts: 1 },
+  });
 });
 
 test('dispatch env overrides win over config values', () => {

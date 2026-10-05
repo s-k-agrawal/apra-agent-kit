@@ -20,7 +20,7 @@ const PLAN = { type: 'plan', _replan: false, plan: { steps: [
 
 test('initialTurn, accepted, queued, started', () => {
   const t0 = initialTurn('weather?');
-  assert.deepEqual(t0, { goal: 'weather?', jobId: null, status: 'submitting', position: null, iteration: 0, plan: null, replans: 0, reviews: [], answer: null, error: null, routedTo: null, memoryRecall: null, memoryLearn: null });
+  assert.deepEqual(t0, { goal: 'weather?', jobId: null, status: 'submitting', position: null, iteration: 0, plan: null, replans: 0, reviews: [], answer: null, error: null, routedTo: null, memoryRecall: null, memoryLearn: null, pendingInput: null, inputError: null, submittingInput: false });
   assert.equal(isLive(t0), true);
   const t1 = accepted(t0, { jobId: JOB, position: 2 });
   assert.equal(t1.status, 'queued'); assert.equal(t1.jobId, JOB); assert.equal(t1.position, 2);

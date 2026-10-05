@@ -62,7 +62,7 @@ test('createMemoryModule wires long-term memory, routes, and events', async () =
     },
   }, { notifier, fleetApi: {}, logger: console });
   assert.equal(mod.conversationContext, null);
-  assert.equal(mod.runState, null);
+  assert.equal(mod.checkpointStore, null);
   assert.equal(mod.learner, null);
   assert.ok(mod.longTerm);
   assert.equal(typeof mod.routes.memoryStore.handler, 'function');
@@ -85,12 +85,14 @@ test('createMemoryModule enables learner, run state, and conversation context on
   }, { notifier: null, fleetApi: { executePrompt() {} }, logger: console });
   assert.ok(mod.conversationContext);
   assert.equal(mod.conversationContext.mode, 'store');
-  assert.ok(mod.runState);
+  // The module exposes the STORE; host/checkpoint/ owns save/load/clear, so
+  // one record serves both crash recovery and a pause.
+  assert.ok(mod.checkpointStore);
   assert.ok(mod.learner);
   assert.ok(mod.longTerm);
   await mod.open();
   try {
-    await mod.runState.save('task-1', { step: 1 });
+    await mod.checkpointStore.store({ id: 'cp-task-1', kind: 'procedure', text: '{}' });
     assert.ok(store.calls.includes('store'));
     assert.ok(ccStore.calls.includes('open'));
   } finally {
@@ -146,7 +148,7 @@ test('createMemoryModule closes ltm and rsStore independently', async () => {
   }, { logger });
   await mod.open();
   await mod.close();
-  assert.ok(rsStore.calls.includes('close'), 'run-state store must close even when long-term close fails');
+  assert.ok(rsStore.calls.includes('close'), 'the checkpoint store must close even when long-term close fails');
   assert.ok(warnings.some(w => /long-term memory/i.test(w)));
 });
 

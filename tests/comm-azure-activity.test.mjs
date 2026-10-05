@@ -131,3 +131,47 @@ test('getHostContext memoises the factory and throws before one is set', async (
   await getHostContext();
   assert.equal(calls, 1);
 });
+
+// ---------------------------------------------------------------------------
+// The run on Azure gets a checkpoint, not just a place to write one at a pause
+//
+// The activity built a checkpoint only to save the pause, and never handed one
+// to executeHostedTask. So on Azure the strategies had nothing to save to as
+// they went and nothing to load on resume: the checkpoint was write-only, and
+// `hasIdempotencyKey` could never be true. The 16 KB pointer was a pointer to
+// a row nobody read.
+// ---------------------------------------------------------------------------
+
+test('the activity gives the run a checkpoint, so work is recorded as it happens', async () => {
+  const api = createMockFleetApi({
+    members: rosterNames(1),
+    promptResponses: ['```tool_call\n{"tool": "inspect-members", "args": {}}\n```', '```done\n{"result": "done", "summary": "s"}\n```'],
+  });
+  const dispatcher = await makeDispatcher();
+  const { createSqliteStore } = await import('../host/memory/store/sqlite.mjs');
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'activity-cp-'));
+  const inner = createSqliteStore({ dbPath: path.join(dir, 'memory.db') });
+
+  // Count what the run writes, through a real store underneath.
+  let saves = 0;
+  const checkpointStore = {
+    ...inner,
+    open: () => inner.open(),
+    close: () => inner.close(),
+    store: async (entry) => { saves += 1; return inner.store(entry); },
+  };
+  await checkpointStore.open();
+
+  try {
+    const activity = createRunTaskActivity({
+      getClient: () => fakeClient(), pollMs: 50,
+      getContext: async () => hostCtx(api, dispatcher, { memory: { checkpointStore } }),
+    });
+    const out = await activity({ jobId: 'job-cp', task: { goal: 'inspect' }, callbackUrl: null }, { warn() {} });
+    assert.equal(out.status, 'completed');
+    assert.ok(saves >= 1, `the run saved a checkpoint as it went (saw ${saves})`);
+  } finally {
+    await checkpointStore.close();
+    await dispatcher.close();
+  }
+});

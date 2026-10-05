@@ -216,7 +216,9 @@ test('advertises exactly the registry tools, with schemas and annotations', asyn
     assert.deepEqual(
       tools.map((tool) => tool.name).sort(),
       [
+        'choose-destination',
         'city-briefing',
+        'confirm-itinerary',
         'country-info',
         'currency',
         'demo',
@@ -234,6 +236,7 @@ test('advertises exactly the registry tools, with schemas and annotations', asyn
         'travel-advisory',
         'travel-prep',
         'trip-planner',
+        'trip-preferences',
         'weather',
         'wikipedia-summary',
       ],

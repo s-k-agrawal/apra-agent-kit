@@ -173,3 +173,43 @@ test('onIteration errors do not break the run', async () => {
   });
   assert.equal(out.status, 'completed');
 });
+
+// ---------------------------------------------------------------------------
+// A suspended run is not a failed one
+//
+// `status` defaults to 'failed', so a strategy that suspends and returns —
+// which is what maxSteps does on the Azure path — would be reported as a
+// failure. The orchestrator would then settle a run that is merely part-way
+// through, and everything it had already done would be thrown away.
+// ---------------------------------------------------------------------------
+
+test('runTask reports a suspended strategy as suspended, with its cursor', async () => {
+  const out = await runTask({ id: 'job-s', goal: 'do two things' }, {
+    strategy: 'open-ended',
+    tools: makeTools(),
+    fleetApi: createMockFleetApi({
+      members: rosterNames(1),
+      promptResponses: [
+        '```tool_call\n{"tool": "weather", "args": {}}\n```',
+        '```tool_call\n{"tool": "weather", "args": {}}\n```',
+        '```done\n{"result": "d", "summary": "s"}\n```',
+      ],
+    }),
+    maxSteps: 1,
+  });
+
+  assert.equal(out.status, 'suspended', `got ${out.status}`);
+  assert.ok(Array.isArray(out.history) && out.history.length >= 1, 'the work it did comes back');
+});
+
+test('an ordinary run is still completed, not suspended', async () => {
+  const out = await runTask({ id: 'job-c', goal: 'one thing' }, {
+    strategy: 'open-ended',
+    tools: makeTools(),
+    fleetApi: createMockFleetApi({
+      members: rosterNames(1),
+      promptResponses: ['```done\n{"result": "d", "summary": "s"}\n```'],
+    }),
+  });
+  assert.equal(out.status, 'completed');
+});

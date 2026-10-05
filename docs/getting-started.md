@@ -226,18 +226,22 @@ ALWAYS use the recall tool before planning to check for relevant
 prior knowledge. Use remember to store useful facts you discover.
 ```
 
-**Run state** — crash recovery. If a task is interrupted mid-execution,
-it resumes from the last checkpoint on restart.
+**Checkpoint** — crash recovery, and the record a paused run resumes from. If a
+task is interrupted mid-execution — by a restart or by a question put to a
+person — it picks up from the last checkpoint rather than starting over.
 
 ```js
 memory: {
-  runState: {
+  checkpoint: {
     enabled: true,
     store: 'sqlite',
-    dbPath: './memory/run-state.db',
+    dbPath: './memory/checkpoint.db',
   },
 }
 ```
+
+`memory.runState` is the former name for this block and is still read, so an
+existing config keeps working.
 
 ### Scheduled Workflows
 
@@ -282,7 +286,7 @@ reference.
 | `budgets.*` | Cost and safety limits per task |
 | `chat.themes` | `['blue']`, `['apra']`, or `['blue', 'apra']` for a toggle |
 | `memory.conversationContext` | Carries chat turns across tasks within a session. Mode: `store` (server persists) or `passthrough` (caller sends) |
-| `memory.runState` | Crash recovery — resumes interrupted tasks from the last checkpoint |
+| `memory.checkpoint` | Crash recovery and pause/resume — one record both read from. `memory.runState` is the former name and still works |
 | `memory.longTerm` | Cross-session fact storage with FSRS-6 decay. Adds `remember`/`recall`/`forget`/`promote` tools |
 | `modules.scheduler` | Cron schedules that fire named workflows (timezone-aware, `queue` or `skip` overlap). Requires `dispatch` enabled. See [scheduled-workflows.md](scheduled-workflows.md) |
 

@@ -43,10 +43,10 @@ modules: {
       answerMaxChars: 500,                // truncate stored answers
     },
 
-    runState: {
+    checkpoint: {                        // former name `runState` still works
       enabled: true,
       store: 'sqlite',
-      dbPath: './memory/run-state.db',
+      dbPath: './memory/checkpoint.db',
     },
 
     longTerm: {
@@ -372,7 +372,9 @@ host/memory/
 │   ├── interface.mjs              # Store contract (7 methods)
 │   ├── sqlite.mjs                 # SQLite adapter
 │   └── cosmos.mjs                 # Cosmos adapter (lazy-loaded)
-├── run-state.mjs                  # Tier 2: crash recovery checkpoints
+├── ../checkpoint/                 # Tier 2: the run checkpoint — crash recovery
+│                                  #   and pause/resume, backed by this module's
+│                                  #   store (see host/checkpoint/)
 ├── long-term.mjs                  # Tier 3: fact lifecycle (store/recall/decay)
 ├── learner.mjs                    # Auto-learn: extract facts after tasks
 ├── preloader.mjs                  # Seed .json knowledge on startup
